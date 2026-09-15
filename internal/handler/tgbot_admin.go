@@ -466,7 +466,7 @@ func (h *TGBotAPIHandler) bindExisting(ctx context.Context, w http.ResponseWrite
 		return
 	}
 	_ = h.repo.WriteTGAudit(ctx, storage.TGAudit{
-		TGID: tgID, Username: user.Username,
+		TGID: &tgID, Username: user.Username,
 		Action: "bind", Detail: "invite_code=" + ic.Code,
 	})
 	if wasUnbound {
@@ -568,7 +568,7 @@ func (h *TGBotAPIHandler) bindNew(ctx context.Context, w http.ResponseWriter,
 	}
 	SendTelegramBoundNotification(ctx, requestedUsername, tgID, tgHandle)
 	_ = h.repo.WriteTGAudit(ctx, storage.TGAudit{
-		TGID: tgID, Username: requestedUsername,
+		TGID: &tgID, Username: requestedUsername,
 		Action: "register", Detail: "invite_code=" + ic.Code,
 	})
 
@@ -623,7 +623,7 @@ func (h *TGBotAPIHandler) bindAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = h.repo.WriteTGAudit(ctx, storage.TGAudit{
-		TGID: body.TelegramID, Username: adminUser, Action: "bind", Detail: "auto-admin",
+		TGID: &body.TelegramID, Username: adminUser, Action: "bind", Detail: "auto-admin",
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "username": adminUser})
 }
@@ -652,7 +652,7 @@ func (h *TGBotAPIHandler) unbind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = h.repo.WriteTGAudit(r.Context(), storage.TGAudit{
-		TGID: body.TelegramID, Username: username,
+		TGID: &body.TelegramID, Username: username,
 		Action: "unbind", Detail: "via tgbot client",
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "username": username})
@@ -1064,7 +1064,7 @@ func (h *TGBotAPIHandler) redeem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = h.repo.WriteTGAudit(ctx, storage.TGAudit{
-		TGID: body.TelegramID, Username: existing, Action: "renew", Detail: "code=" + ic.Code,
+		TGID: &body.TelegramID, Username: existing, Action: "renew", Detail: "code=" + ic.Code,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success": true, "kind": "renew", "username": existing,

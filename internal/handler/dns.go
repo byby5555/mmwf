@@ -9,7 +9,7 @@ import (
 
 type dnsHandler struct{}
 
-// 返回提供 DNS 解析服务的处理程序。
+// NewDNSHandler returns a handler that provides DNS resolution services.
 func NewDNSHandler() http.Handler {
 	return &dnsHandler{}
 }

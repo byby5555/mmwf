@@ -12,14 +12,36 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// 使用新字段值更新现有代理节点，同时保留原始节点样式
+// proxyKeysChanged checks if the key set of the existing proxy node differs from the new config
+func proxyKeysChanged(proxyNode *yaml.Node, newConfig map[string]any) bool {
+	if proxyNode == nil || proxyNode.Kind != yaml.MappingNode {
+		return true
+	}
+	existingKeys := make(map[string]struct{})
+	for i := 0; i < len(proxyNode.Content); i += 2 {
+		if i+1 < len(proxyNode.Content) {
+			existingKeys[proxyNode.Content[i].Value] = struct{}{}
+		}
+	}
+	if len(existingKeys) != len(newConfig) {
+		return true
+	}
+	for key := range newConfig {
+		if _, ok := existingKeys[key]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+// updateProxyNodeFields updates an existing proxy node with new field values while preserving original node styles
 func updateProxyNodeFields(proxyNode *yaml.Node, newConfig map[string]any) {
 	if proxyNode == nil || proxyNode.Kind != yaml.MappingNode {
 		return
 	}
 
-	// 构建现有领域关键节点图
-	existingFields := make(map[string]*yaml.Node) // 字段名 -> 值节点
+	// Build a map of existing field key nodes
+	existingFields := make(map[string]*yaml.Node) // fieldName -> valueNode
 	for i := 0; i < len(proxyNode.Content); i += 2 {
 		if i+1 >= len(proxyNode.Content) {
 			break
@@ -29,16 +51,16 @@ func updateProxyNodeFields(proxyNode *yaml.Node, newConfig map[string]any) {
 		existingFields[keyNode.Value] = valueNode
 	}
 
-	// 使用新值更新现有值节点，保留其样式
+	// Update existing value nodes with new values, preserving their style
 	for key, newValue := range newConfig {
 		if valueNode, exists := existingFields[key]; exists {
-			// 更新现有值节点的值，保留其 Kind 和 Style
+			// Update the existing value node's value, preserving its Kind and Style
 			updateValueNode(valueNode, newValue)
 		}
 	}
 }
 
-// 对代理节点中的字段就地重新排序
+// reorderProxyNodeFieldsInPlace reorders fields in a proxy node in-place
 func reorderProxyNodeFieldsInPlace(proxyNode *yaml.Node) {
 	if proxyNode == nil || proxyNode.Kind != yaml.MappingNode {
 		return
@@ -47,7 +69,7 @@ func reorderProxyNodeFieldsInPlace(proxyNode *yaml.Node) {
 	proxyNode.Content = reordered.Content
 }
 
-// 更新 yaml.Node 的值，同时尝试保留其原始类型/样式
+// updateValueNode updates a yaml.Node's value while trying to preserve its original type/style
 func updateValueNode(node *yaml.Node, newValue any) {
 	if node == nil {
 		return
@@ -55,11 +77,11 @@ func updateValueNode(node *yaml.Node, newValue any) {
 
 	switch v := newValue.(type) {
 	case string:
-		// 如果节点已经是标量，则保留节点的种类和标签
+		// Preserve the node's kind and tag if it's already a scalar
 		if node.Kind == yaml.ScalarNode {
 			node.Value = v
-			// 如果值看起来像数字，请清除 !!str 标记，以防止引用
-			// 只保留空字符串的 !!str 标签
+			// Clear !!str tag if the value looks like a number, to prevent quoting
+			// Only keep !!str tag for empty strings
 			if v != "" && node.Tag == "!!str" {
 				node.Tag = ""
 			}
@@ -104,18 +126,18 @@ func updateValueNode(node *yaml.Node, newValue any) {
 			}
 		}
 	case map[string]any:
-		// 对于嵌套对象，递归更新
+		// For nested objects, recursively update
 		if node.Kind == yaml.MappingNode {
 			updateProxyNodeFields(node, v)
 		}
-		// 否则，我们需要重建整个结构
+		// Otherwise, we'd need to rebuild the entire structure
 	case []any:
-		// 对于数组，我们需要重建
+		// For arrays, we need to rebuild
 		if node.Kind != yaml.SequenceNode {
 			node.Kind = yaml.SequenceNode
 			node.Content = nil
 		}
-		// 清除并重建内容
+		// Clear and rebuild content
 		node.Content = nil
 		for _, item := range v {
 			node.Content = append(node.Content, encodeValue(item))
@@ -123,7 +145,7 @@ func updateValueNode(node *yaml.Node, newValue any) {
 	}
 }
 
-// 将 Go 值转换为 yaml.Node
+// encodeValue converts a Go value to a yaml.Node
 func encodeValue(value any) *yaml.Node {
 	node := &yaml.Node{}
 
@@ -212,7 +234,7 @@ func encodeValue(value any) *yaml.Node {
 			}
 		}
 	default:
-		// 后备：编码为字符串
+		// Fallback: encode as string
 		node.Kind = yaml.ScalarNode
 		node.SetString(fmt.Sprintf("%v", v))
 	}
@@ -220,7 +242,7 @@ func encodeValue(value any) *yaml.Node {
 	return node
 }
 
-// ConvertNilToEmptyString 在映射中递归地将 nil 值转换为空字符串
+// convertNilToEmptyString recursively converts nil values to empty strings in a map
 func convertNilToEmptyString(m map[string]any) {
 	for k, v := range m {
 		if v == nil {
@@ -239,63 +261,63 @@ func convertNilToEmptyString(m map[string]any) {
 	}
 }
 
-// 将映射编组到 YAML，确保引用空字符串
+// MarshalYAMLWithQuotedEmptyStrings marshals a map to YAML ensuring empty strings are quoted
 func MarshalYAMLWithQuotedEmptyStrings(data map[string]any) ([]byte, error) {
-	// 首先将 nil 值转换为空字符串
+	// Convert nil values to empty strings first
 	convertNilToEmptyString(data)
 
-	// 使用我们的自定义encodeValue构建根YAML节点
+	// Build the root YAML node using our custom encodeValue
 	rootNode := encodeValue(data)
 
-	// 创建 YAML 文档
+	// Create a YAML document
 	doc := &yaml.Node{
 		Kind:    yaml.DocumentNode,
 		Content: []*yaml.Node{rootNode},
 	}
 
-	// 封送至字节
+	// Marshal to bytes
 	return yaml.Marshal(doc)
 }
 
-// 递归修复短 id 字段以使用双引号
+// fixShortIdStyleInNode recursively fixes short-id fields to use double quotes
 func fixShortIdStyleInNode(node *yaml.Node) {
 	if node == nil {
 		return
 	}
 
-	// 流程图节点（对象）
+	// Process mapping nodes (objects)
 	if node.Kind == yaml.MappingNode {
 		for i := 0; i < len(node.Content); i += 2 {
 			if i+1 < len(node.Content) {
 				keyNode := node.Content[i]
 				valueNode := node.Content[i+1]
 
-				// 如果这是一个短 ID 字段，请确保该值使用双引号
+				// If this is a short-id field, ensure the value uses double quotes
 				if keyNode.Value == "short-id" {
 					if valueNode.Kind == yaml.ScalarNode {
 						valueNode.Tag = "!!str"
 						valueNode.Style = yaml.DoubleQuotedStyle
-						// 确保该值是字符串
+						// Ensure the value is a string
 						if valueNode.Value == "" || valueNode.Value == "null" {
 							valueNode.Value = ""
 						}
 					}
 				}
 
-				// 递归处理值节点
+				// Recursively process the value node
 				fixShortIdStyleInNode(valueNode)
 			}
 		}
 	}
 
-	// 处理序列节点（数组）
+	// Process sequence nodes (arrays)
 	if node.Kind == yaml.SequenceNode {
 		for _, child := range node.Content {
 			fixShortIdStyleInNode(child)
 		}
 	}
 
-	// 流程文档节点
+	// Process document nodes
 	if node.Kind == yaml.DocumentNode {
 		for _, child := range node.Content {
 			fixShortIdStyleInNode(child)
@@ -303,35 +325,35 @@ func fixShortIdStyleInNode(node *yaml.Node) {
 	}
 }
 
-// 更新所有 YAML 订阅文件中的节点信息
+// syncNodeToYAMLFiles updates node information in all YAML subscription files
 func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashConfigJSON string) error {
 	if subscribeDir == "" {
 		return fmt.Errorf("subscribe directory is empty")
 	}
 
-	// 解析新的冲突配置
+	// Parse the new clash config
 	var newClashConfig map[string]any
 	if err := json.Unmarshal([]byte(clashConfigJSON), &newClashConfig); err != nil {
 		return fmt.Errorf("parse new clash config: %w", err)
 	}
 
-	// 将 nil 值转换为空字符串（例如，对于短 id 字段）
+	// Convert nil values to empty strings (e.g., for short-id field)
 	convertNilToEmptyString(newClashConfig)
 
-	// 获取订阅目录中的所有 YAML 文件
+	// Get all YAML files in subscribes directory
 	entries, err := os.ReadDir(subscribeDir)
 	if err != nil {
 		return fmt.Errorf("read subscribe directory: %w", err)
 	}
 
-	// 处理每个 YAML 文件
+	// Process each YAML file
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 
 		filename := entry.Name()
-		// 跳过非 YAML 文件和 .keep.yaml 占位符
+		// Skip non-YAML files and the .keep.yaml placeholder
 		if filepath.Ext(filename) != ".yaml" && filepath.Ext(filename) != ".yml" {
 			continue
 		}
@@ -341,19 +363,19 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 
 		filePath := filepath.Join(subscribeDir, filename)
 
-		// 读取 YAML 文件
+		// Read YAML file
 		data, err := os.ReadFile(filePath)
 		if err != nil {
-			continue // 跳过我们无法读取的文件
+			continue // Skip files we can't read
 		}
 
-		// 解析 YAML
+		// Parse YAML
 		var yamlContent map[string]any
 		if err := yaml.Unmarshal(data, &yamlContent); err != nil {
-			continue // 跳过无效的 YAML 文件
+			continue // Skip invalid YAML files
 		}
 
-		// 检查文件是否有代理字段
+		// Check if file has proxies field
 		proxies, ok := yamlContent["proxies"].([]any)
 		if !ok || len(proxies) == 0 {
 			continue
@@ -362,7 +384,7 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 		modified := false
 		nameChanged := oldNodeName != newNodeName
 
-		// 更新或删除匹配的节点
+		// Update or remove matching nodes
 		newProxies := make([]any, 0, len(proxies))
 		for _, proxy := range proxies {
 			proxyMap, ok := proxy.(map[string]any)
@@ -377,14 +399,14 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 				continue
 			}
 
-			// 如果姓名与旧姓名相符
+			// If name matches old name
 			if proxyName == oldNodeName {
 				if nameChanged {
-					// 名称已更改：在当前位置替换为新配置
+					// Name changed: replace with new config at current position
 					newProxies = append(newProxies, newClashConfig)
 					modified = true
 				} else {
-					// 名称不变：更新节点配置
+					// Name unchanged: update node config in place
 					for key, value := range newClashConfig {
 						proxyMap[key] = value
 					}
@@ -396,19 +418,19 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 			}
 		}
 
-		// 如果没有任何改变，则跳过该文件
+		// If nothing changed, skip this file
 		if !modified {
 			continue
 		}
 
-		// 使用有序字段更新 YAML 内容中的代理
+		// Update proxies in YAML content with ordered fields
 		orderedProxiesForMap := make([]any, 0, len(newProxies))
 		for _, proxy := range newProxies {
 			orderedProxiesForMap = append(orderedProxiesForMap, proxy)
 		}
 		yamlContent["proxies"] = orderedProxiesForMap
 
-		// 如果代理组引用旧名称，则还要更新它们
+		// Also update proxy-groups if they reference the old name
 		if proxyGroups, ok := yamlContent["proxy-groups"].([]any); ok {
 			for _, group := range proxyGroups {
 				groupMap, ok := group.(map[string]any)
@@ -416,7 +438,7 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 					continue
 				}
 
-				// 更新组中的代理列表
+				// Update proxies list in group
 				if groupProxies, ok := groupMap["proxies"].([]any); ok {
 					updatedGroupProxies := make([]any, 0, len(groupProxies))
 					for _, groupProxy := range groupProxies {
@@ -427,7 +449,7 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 						}
 
 						if proxyName == oldNodeName && nameChanged {
-							// 用新名称替换旧名称
+							// Replace old name with new name
 							updatedGroupProxies = append(updatedGroupProxies, newNodeName)
 						} else {
 							updatedGroupProxies = append(updatedGroupProxies, groupProxy)
@@ -438,7 +460,7 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 			}
 		}
 
-		// 如果规则引用旧名称，也更新规则
+		// Also update rules if they reference the old name
 		if rules, ok := yamlContent["rules"].([]any); ok {
 			updatedRules := make([]any, 0, len(rules))
 			for _, rule := range rules {
@@ -448,9 +470,9 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 					continue
 				}
 
-				// 检查规则是否引用旧节点名称
+				// Check if rule references the old node name
 				if nameChanged && containsNodeName(ruleStr, oldNodeName) {
-					// 将规则中的旧名称替换为新名称
+					// Replace old name with new name in rule
 					updatedRules = append(updatedRules, replaceNodeNameInRule(ruleStr, oldNodeName, newNodeName))
 				} else {
 					updatedRules = append(updatedRules, rule)
@@ -459,17 +481,17 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 			yamlContent["rules"] = updatedRules
 		}
 
-		// 将文件重新读取为 yaml.Node 以保留结构
+		// Re-read the file as yaml.Node to preserve structure
 		var rootNode yaml.Node
 		if err := yaml.Unmarshal(data, &rootNode); err != nil {
 			continue
 		}
 
-		// 查找并更新代理部分，保留原始节点样式
+		// Find and update the proxies section, preserving original node styles
 		if rootNode.Kind == yaml.DocumentNode && len(rootNode.Content) > 0 {
 			docNode := rootNode.Content[0]
 			if docNode.Kind == yaml.MappingNode {
-				// 找到代理密钥
+				// Find the proxies key
 				for i := 0; i < len(docNode.Content); i += 2 {
 					if i+1 >= len(docNode.Content) {
 						break
@@ -478,13 +500,13 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 					if keyNode.Value == "proxies" {
 						proxiesNode := docNode.Content[i+1]
 						if proxiesNode.Kind == yaml.SequenceNode {
-							// 就地更新代理以保留节点样式
+							// Update proxies in-place to preserve node styles
 							for j, proxyNode := range proxiesNode.Content {
 								if proxyNode.Kind != yaml.MappingNode {
 									continue
 								}
 
-								// 找到这个代理节点中的name字段
+								// Find the name field in this proxy node
 								var proxyName string
 								for k := 0; k < len(proxyNode.Content); k += 2 {
 									if k+1 >= len(proxyNode.Content) {
@@ -496,15 +518,15 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 									}
 								}
 
-								// 如果此代理与正在更新的代理匹配
+								// If this proxy matches the one being updated
 								if proxyName == oldNodeName {
-									if nameChanged {
-										// 用新配置替换整个代理节点
+									if nameChanged || proxyKeysChanged(proxyNode, newClashConfig) {
+										// Replace entire proxy node with new config
 										proxiesNode.Content[j] = util.ReorderProxyFieldsToNode(newClashConfig)
 									} else {
-										// 就地更新字段，保留原始节点样式
+										// Update fields in-place, preserving original node styles
 										updateProxyNodeFields(proxyNode, newClashConfig)
-										// 重新排序字段以将优先字段放在第一位
+										// Reorder fields to put priority fields first
 										reorderProxyNodeFieldsInPlace(proxyNode)
 									}
 								}
@@ -514,7 +536,7 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 					}
 				}
 
-				// 如果名称更改则更新代理组
+				// Update proxy-groups if name changed
 				if nameChanged {
 					for i := 0; i < len(docNode.Content); i += 2 {
 						if i+1 >= len(docNode.Content) {
@@ -527,7 +549,7 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 						}
 					}
 
-					// 如果名称更改则更新规则
+					// Update rules if name changed
 					for i := 0; i < len(docNode.Content); i += 2 {
 						if i+1 >= len(docNode.Content) {
 							break
@@ -540,7 +562,7 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 					}
 				}
 
-				// 重新排序代理组字段
+				// Reorder proxy-groups fields
 				for i := 0; i < len(docNode.Content); i += 2 {
 					if i+1 >= len(docNode.Content) {
 						break
@@ -548,7 +570,7 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 					if docNode.Content[i].Value == "proxy-groups" {
 						proxyGroupsNode := docNode.Content[i+1]
 						if proxyGroupsNode.Kind == yaml.SequenceNode {
-							// 对每个代理组中的字段重新排序
+							// Reorder fields in each proxy group
 							for _, groupNode := range proxyGroupsNode.Content {
 								if groupNode.Kind == yaml.MappingNode {
 									reorderProxyGroupFields(groupNode)
@@ -559,25 +581,25 @@ func syncNodeToYAMLFiles(subscribeDir, oldNodeName, newNodeName string, clashCon
 					}
 				}
 
-				// 重新排序顶级字段，将 dns、代理、代理组放在规则提供者之前
+				// Reorder top-level fields to put dns, proxies, proxy-groups before rule-providers
 				reorderTopLevelFields(docNode)
 			}
 		}
 
-		// 修复短 ID 字段以在封送之前使用双引号
+		// Fix short-id fields to use double quotes before marshaling
 		fixShortIdStyleInNode(&rootNode)
 
 		// Encode to YAML using yaml.Marshal on the node (使用2空格缩进)
 		output, err := MarshalYAMLWithIndent(&rootNode)
 		if err != nil {
-			continue // 跳过我们无法封送的文件
+			continue // Skip files we can't marshal
 		}
 
-		// 修复表情符号转义和引用的数字
+		// Fix emoji escapes and quoted numbers
 		fixed := RemoveUnicodeEscapeQuotes(string(output))
 
 		if err := os.WriteFile(filePath, []byte(fixed), 0644); err != nil {
-			continue // 跳过我们无法写入的文件
+			continue // Skip files we can't write
 		}
 	}
 
@@ -690,11 +712,11 @@ func batchSyncNodesToYAMLFiles(subscribeDir string, updates []NodeUpdate) error 
 								// 检查是否需要更新此节点
 								if update, exists := updateMap[proxyName]; exists {
 									nameChanged := update.oldName != update.newName
-									if nameChanged {
-										// 名称改变：替换整个节点
+									if nameChanged || proxyKeysChanged(proxyNode, update.clashConfig) {
+										// 名称改变或属性增删：替换整个节点
 										proxiesNode.Content[j] = util.ReorderProxyFieldsToNode(update.clashConfig)
 									} else {
-										// 名称不变：就地更新字段
+										// 仅值变化：就地更新字段
 										updateProxyNodeFields(proxyNode, update.clashConfig)
 										reorderProxyNodeFieldsInPlace(proxyNode)
 									}
@@ -784,7 +806,7 @@ func batchSyncNodesToYAMLFiles(subscribeDir string, updates []NodeUpdate) error 
 	return nil
 }
 
-// 更新代理组节点以用新名称替换旧节点名称
+// updateProxyGroupsNode updates proxy-groups node to replace old node name with new name
 func updateProxyGroupsNode(groupsNode *yaml.Node, oldName, newName string) {
 	if groupsNode.Kind != yaml.SequenceNode {
 		return
@@ -795,7 +817,7 @@ func updateProxyGroupsNode(groupsNode *yaml.Node, oldName, newName string) {
 			continue
 		}
 
-		// 在该组中找到“代理”键
+		// Find the "proxies" key in this group
 		for i := 0; i < len(groupNode.Content); i += 2 {
 			if i+1 >= len(groupNode.Content) {
 				break
@@ -804,7 +826,7 @@ func updateProxyGroupsNode(groupsNode *yaml.Node, oldName, newName string) {
 			if keyNode.Value == "proxies" {
 				valueNode := groupNode.Content[i+1]
 				if valueNode.Kind == yaml.SequenceNode {
-					// 更新序列中的代理名称
+					// Update proxy names in the sequence
 					for _, proxyNode := range valueNode.Content {
 						if proxyNode.Kind == yaml.ScalarNode && proxyNode.Value == oldName {
 							proxyNode.Value = newName
@@ -817,7 +839,7 @@ func updateProxyGroupsNode(groupsNode *yaml.Node, oldName, newName string) {
 	}
 }
 
-// 更新规则节点以用新名称替换旧节点名称
+// updateRulesNode updates rules node to replace old node name with new name
 func updateRulesNode(rulesNode *yaml.Node, oldName, newName string) {
 	if rulesNode.Kind != yaml.SequenceNode {
 		return
@@ -832,9 +854,9 @@ func updateRulesNode(rulesNode *yaml.Node, oldName, newName string) {
 	}
 }
 
-// 检查规则字符串是否引用节点名称
+// containsNodeName checks if a rule string references a node name
 func containsNodeName(rule, nodeName string) bool {
-	// 规则格式：TYPE,PARAM,NODE_NAME
+	// Rules format: TYPE,PARAM,NODE_NAME
 	// Example: DOMAIN-SUFFIX,google.com,节点名称
 	parts := splitRule(rule)
 	if len(parts) >= 3 {
@@ -843,7 +865,7 @@ func containsNodeName(rule, nodeName string) bool {
 	return false
 }
 
-// ReplaceNodeNameInRule 替换规则字符串中的节点名称
+// replaceNodeNameInRule replaces node name in a rule string
 func replaceNodeNameInRule(rule, oldName, newName string) string {
 	parts := splitRule(rule)
 	if len(parts) >= 3 && parts[len(parts)-1] == oldName {
@@ -860,7 +882,7 @@ func replaceNodeNameInRule(rule, oldName, newName string) string {
 	return rule
 }
 
-// 用逗号分割规则字符串，处理转义逗号
+// splitRule splits a rule string by comma, handling escaped commas
 func splitRule(rule string) []string {
 	var parts []string
 	var current string
@@ -894,13 +916,13 @@ func splitRule(rule string) []string {
 	return parts
 }
 
-// 重新排序顶级 YAML 字段，将重要部分放在前面
+// reorderTopLevelFields reorders the top-level YAML fields to put important sections first
 func reorderTopLevelFields(docNode *yaml.Node) {
 	if docNode.Kind != yaml.MappingNode {
 		return
 	}
 
-	// 定义字段对结构
+	// Define field pair structure
 	type fieldPair struct {
 		key   *yaml.Node
 		value *yaml.Node
@@ -925,11 +947,11 @@ func reorderTopLevelFields(docNode *yaml.Node) {
 		"geox-url",
 	}
 
-	// 创建一个map来存储所有的键值对
+	// Create a map to store all key-value pairs
 	fieldMap := make(map[string]*fieldPair)
 	var otherFields []*fieldPair
 
-	// 提取所有字段
+	// Extract all fields
 	for i := 0; i < len(docNode.Content); i += 2 {
 		if i+1 >= len(docNode.Content) {
 			break
@@ -939,7 +961,7 @@ func reorderTopLevelFields(docNode *yaml.Node) {
 
 		pair := &fieldPair{key: keyNode, value: valueNode}
 
-		// 检查这是否是优先字段
+		// Check if this is a priority field
 		isPriority := false
 		for _, pf := range priorityFields {
 			if keyNode.Value == pf {
@@ -954,46 +976,46 @@ func reorderTopLevelFields(docNode *yaml.Node) {
 		}
 	}
 
-	// 首先使用优先字段重建内容
+	// Rebuild Content with priority fields first
 	newContent := make([]*yaml.Node, 0, len(docNode.Content))
 
-	// 按顺序添加优先级字段
+	// Add priority fields in order
 	for _, fieldName := range priorityFields {
 		if pair, ok := fieldMap[fieldName]; ok {
 			newContent = append(newContent, pair.key, pair.value)
 		}
 	}
 
-	// 按原始顺序添加剩余字段
+	// Add remaining fields in their original order
 	for _, pair := range otherFields {
 		newContent = append(newContent, pair.key, pair.value)
 	}
 
-	// 替换内容
+	// Replace the content
 	docNode.Content = newContent
 }
 
-// 从所有 YAML 订阅文件中删除节点并返回受影响的文件
+// deleteNodeFromYAMLFilesWithLog removes node from all YAML subscription files and returns affected files
 func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, error) {
 	affectedFiles := []string{}
 	if subscribeDir == "" {
 		return affectedFiles, fmt.Errorf("subscribe directory is empty")
 	}
 
-	// 获取订阅目录中的所有 YAML 文件
+	// Get all YAML files in subscribes directory
 	entries, err := os.ReadDir(subscribeDir)
 	if err != nil {
 		return affectedFiles, fmt.Errorf("read subscribe directory: %w", err)
 	}
 
-	// 处理每个 YAML 文件
+	// Process each YAML file
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 
 		filename := entry.Name()
-		// 跳过非 YAML 文件和 .keep.yaml 占位符
+		// Skip non-YAML files and the .keep.yaml placeholder
 		if filepath.Ext(filename) != ".yaml" && filepath.Ext(filename) != ".yml" {
 			continue
 		}
@@ -1003,19 +1025,19 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 
 		filePath := filepath.Join(subscribeDir, filename)
 
-		// 读取 YAML 文件
+		// Read YAML file
 		data, err := os.ReadFile(filePath)
 		if err != nil {
-			continue // 跳过我们无法读取的文件
+			continue // Skip files we can't read
 		}
 
-		// 解析 YAML
+		// Parse YAML
 		var yamlContent map[string]any
 		if err := yaml.Unmarshal(data, &yamlContent); err != nil {
-			continue // 跳过无效的 YAML 文件
+			continue // Skip invalid YAML files
 		}
 
-		// 检查文件是否有代理字段
+		// Check if file has proxies field
 		proxies, ok := yamlContent["proxies"].([]any)
 		if !ok || len(proxies) == 0 {
 			continue
@@ -1023,7 +1045,7 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 
 		modified := false
 
-		// 删除匹配的节点
+		// Remove matching nodes
 		newProxies := make([]any, 0, len(proxies))
 		for _, proxy := range proxies {
 			proxyMap, ok := proxy.(map[string]any)
@@ -1038,7 +1060,7 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 				continue
 			}
 
-			// 如果名称匹配，则跳过此代理（将其删除）
+			// If name matches, skip this proxy (delete it)
 			if proxyName == nodeName {
 				modified = true
 				continue
@@ -1047,18 +1069,18 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 			newProxies = append(newProxies, proxyMap)
 		}
 
-		// 如果没有任何改变，则跳过该文件
+		// If nothing changed, skip this file
 		if !modified {
 			continue
 		}
 
-		// 将此文件标记为受影响
+		// Mark this file as affected
 		affectedFiles = append(affectedFiles, filename)
 
-		// 更新 YAML 内容中的代理
+		// Update proxies in YAML content
 		yamlContent["proxies"] = newProxies
 
-		// 如果代理组引用该节点，也从代理组中删除
+		// Also remove from proxy-groups if they reference the node
 		if proxyGroups, ok := yamlContent["proxy-groups"].([]any); ok {
 			for _, group := range proxyGroups {
 				groupMap, ok := group.(map[string]any)
@@ -1066,7 +1088,7 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 					continue
 				}
 
-				// 从组中的代理列表中删除
+				// Remove from proxies list in group
 				if groupProxies, ok := groupMap["proxies"].([]any); ok {
 					updatedGroupProxies := make([]any, 0, len(groupProxies))
 					for _, groupProxy := range groupProxies {
@@ -1076,7 +1098,7 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 							continue
 						}
 
-						// 如果这是要删除的节点则跳过
+						// Skip if this is the node to delete
 						if proxyName != nodeName {
 							updatedGroupProxies = append(updatedGroupProxies, groupProxy)
 						}
@@ -1086,7 +1108,7 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 			}
 		}
 
-		// 如果规则引用了该节点，也从规则中删除
+		// Also remove from rules if they reference the node
 		if rules, ok := yamlContent["rules"].([]any); ok {
 			updatedRules := make([]any, 0, len(rules))
 			for _, rule := range rules {
@@ -1096,7 +1118,7 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 					continue
 				}
 
-				// 跳过引用该节点的规则
+				// Skip rules that reference this node
 				if !containsNodeName(ruleStr, nodeName) {
 					updatedRules = append(updatedRules, rule)
 				}
@@ -1104,17 +1126,17 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 			yamlContent["rules"] = updatedRules
 		}
 
-		// 将文件重新读取为 yaml.Node 以保留结构
+		// Re-read the file as yaml.Node to preserve structure
 		var rootNode yaml.Node
 		if err := yaml.Unmarshal(data, &rootNode); err != nil {
 			continue
 		}
 
-		// 查找并更新部分
+		// Find and update the sections
 		if rootNode.Kind == yaml.DocumentNode && len(rootNode.Content) > 0 {
 			docNode := rootNode.Content[0]
 			if docNode.Kind == yaml.MappingNode {
-				// 更新代理部分 - 删除具有匹配名称的节点
+				// Update proxies section - remove nodes with matching name
 				for i := 0; i < len(docNode.Content); i += 2 {
 					if i+1 >= len(docNode.Content) {
 						break
@@ -1123,7 +1145,7 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 					if keyNode.Value == "proxies" {
 						proxiesNode := docNode.Content[i+1]
 						if proxiesNode.Kind == yaml.SequenceNode {
-							// 过滤掉名称匹配的代理，保留其他代理
+							// Filter out proxies with matching name, preserving others
 							newContent := []*yaml.Node{}
 							for _, proxyNode := range proxiesNode.Content {
 								if proxyNode.Kind != yaml.MappingNode {
@@ -1131,7 +1153,7 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 									continue
 								}
 
-								// 找到这个代理节点中的name字段
+								// Find the name field in this proxy node
 								var proxyName string
 								for k := 0; k < len(proxyNode.Content); k += 2 {
 									if k+1 >= len(proxyNode.Content) {
@@ -1143,7 +1165,7 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 									}
 								}
 
-								// 如果名称不匹配，则保留代理
+								// Keep proxy if name doesn't match
 								if proxyName != nodeName {
 									newContent = append(newContent, proxyNode)
 								}
@@ -1154,7 +1176,7 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 					}
 				}
 
-				// 更新代理组以删除节点引用
+				// Update proxy-groups to remove node references
 				for i := 0; i < len(docNode.Content); i += 2 {
 					if i+1 >= len(docNode.Content) {
 						break
@@ -1166,7 +1188,7 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 					}
 				}
 
-				// 更新规则以删除节点引用
+				// Update rules to remove node references
 				for i := 0; i < len(docNode.Content); i += 2 {
 					if i+1 >= len(docNode.Content) {
 						break
@@ -1178,38 +1200,38 @@ func deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName string) ([]string, er
 					}
 				}
 
-				// 重新排序顶级字段
+				// Reorder top-level fields
 				reorderTopLevelFields(docNode)
 			}
 		}
 
-		// 修复短 ID 字段以在封送之前使用双引号
+		// Fix short-id fields to use double quotes before marshaling
 		fixShortIdStyleInNode(&rootNode)
 
 		// Encode to YAML (使用2空格缩进)
 		output, err := MarshalYAMLWithIndent(&rootNode)
 		if err != nil {
-			continue // 跳过我们无法封送的文件
+			continue // Skip files we can't marshal
 		}
 
-		// 后处理以修复表情符号和短 ID 格式
+		// Post-process to fix emoji and short-id formatting
 		result := RemoveUnicodeEscapeQuotes(string(output))
 
 		if err := os.WriteFile(filePath, []byte(result), 0644); err != nil {
-			continue // 跳过我们无法写入的文件
+			continue // Skip files we can't write
 		}
 	}
 
 	return affectedFiles, nil
 }
 
-// 从所有 YAML 订阅文件中删除节点（传统包装器以实现兼容性）
+// deleteNodeFromYAMLFiles removes node from all YAML subscription files (legacy wrapper for compatibility)
 func deleteNodeFromYAMLFiles(subscribeDir, nodeName string) error {
 	_, err := deleteNodeFromYAMLFilesWithLog(subscribeDir, nodeName)
 	return err
 }
 
-// 从代理组中删除节点引用
+// removeNodeFromProxyGroupsNode removes node references from proxy-groups
 func removeNodeFromProxyGroupsNode(groupsNode *yaml.Node, nodeName string) {
 	if groupsNode.Kind != yaml.SequenceNode {
 		return
@@ -1220,7 +1242,7 @@ func removeNodeFromProxyGroupsNode(groupsNode *yaml.Node, nodeName string) {
 			continue
 		}
 
-		// 在该组中找到“代理”键
+		// Find the "proxies" key in this group
 		for i := 0; i < len(groupNode.Content); i += 2 {
 			if i+1 >= len(groupNode.Content) {
 				break
@@ -1229,7 +1251,7 @@ func removeNodeFromProxyGroupsNode(groupsNode *yaml.Node, nodeName string) {
 			if keyNode.Value == "proxies" {
 				valueNode := groupNode.Content[i+1]
 				if valueNode.Kind == yaml.SequenceNode {
-					// 删除与nodeName匹配的代理节点
+					// Remove proxy nodes that match nodeName
 					newContent := make([]*yaml.Node, 0, len(valueNode.Content))
 					for _, proxyNode := range valueNode.Content {
 						if proxyNode.Kind == yaml.ScalarNode && proxyNode.Value != nodeName {
@@ -1244,13 +1266,13 @@ func removeNodeFromProxyGroupsNode(groupsNode *yaml.Node, nodeName string) {
 	}
 }
 
-// 删除引用该节点的规则
+// removeNodeFromRulesNode removes rules that reference the node
 func removeNodeFromRulesNode(rulesNode *yaml.Node, nodeName string) {
 	if rulesNode.Kind != yaml.SequenceNode {
 		return
 	}
 
-	// 过滤掉引用该节点的规则
+	// Filter out rules that reference the node
 	newContent := make([]*yaml.Node, 0, len(rulesNode.Content))
 	for _, ruleNode := range rulesNode.Content {
 		if ruleNode.Kind == yaml.ScalarNode {

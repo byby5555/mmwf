@@ -37,15 +37,12 @@ type credentialsRequest struct {
 }
 
 // GetClientIP extracts the client IP address from the request.
-// 优先级:CF-Connecting-IP > X-Forwarded-For[0] > X-Real-IP > RemoteAddr。
-// Cloudflare 头单独优先 — 套 CF 的反代往往同时设置 XFF,但 CF 头是 Cloudflare 注入的、最可信。
+// 优先级: CF-Connecting-IP > X-Forwarded-For[0] > X-Real-IP > RemoteAddr
 func GetClientIP(r *http.Request) string {
-	// Cloudflare 专属头
 	if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {
 		return cf
 	}
 
-	// 首先检查 X-Forwarded-For 标头（对于代理请求）
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		ips := strings.Split(xff, ",")
 		if len(ips) > 0 {
@@ -53,12 +50,12 @@ func GetClientIP(r *http.Request) string {
 		}
 	}
 
-	// 检查 X-Real-IP 标头
+	// Check X-Real-IP header
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
 		return strings.TrimSpace(xri)
 	}
 
-	// 回退到 RemoteAddr
+	// Fall back to RemoteAddr
 	ip := r.RemoteAddr
 	if idx := strings.LastIndex(ip, ":"); idx != -1 {
 		ip = ip[:idx]
@@ -66,7 +63,7 @@ func GetClientIP(r *http.Request) string {
 	return ip
 }
 
-func NewLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, repo *storage.TrafficRepository, rateLimiter *LoginRateLimiter, twoFactorStore *auth.TwoFactorPendingStore, turnstile *captcha.Turnstile) http.Handler {
+func NewLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, repo *storage.TrafficRepository, rateLimiter *LoginRateLimiter, twoFactorStore *auth.TwoFactorPendingStore, turnstile ...*captcha.Turnstile) http.Handler {
 	if manager == nil || tokens == nil {
 		panic("login handler requires manager and token store")
 	}
@@ -90,19 +87,17 @@ func NewLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, repo *stora
 
 		username := strings.TrimSpace(payload.Username)
 		clientIP := GetClientIP(r)
+		if len(turnstile) > 0 && turnstile[0] != nil && !turnstile[0].Verify(r.Context(), payload.TurnstileToken, clientIP) {
+			writeError(w, http.StatusBadRequest, errors.New("captcha verification failed"))
+			return
+		}
 
+		// 检查速率限制
 		if rateLimiter != nil {
 			if err := rateLimiter.Check(clientIP, username); err != nil {
 				writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts, please try again later"))
 				return
 			}
-		}
-
-		// Turnstile 人机验证:Enabled 内部已查 DB 看两 key 是否都填,未填则放行。
-		// 失败按 plan 用 400 — 跟 mmwx-license 一致(不混淆 401 invalid credentials 的语义)。
-		if turnstile != nil && !turnstile.Verify(r.Context(), payload.TurnstileToken, clientIP) {
-			writeError(w, http.StatusBadRequest, errors.New("captcha verification failed"))
-			return
 		}
 
 		ok, err := manager.Authenticate(r.Context(), username, payload.Password)
@@ -112,31 +107,19 @@ func NewLoginHandler(manager *auth.Manager, tokens *auth.TokenStore, repo *stora
 		}
 
 		if !ok {
-			locked := false
+			// 记录登录失败
 			if rateLimiter != nil {
 				rateLimiter.RecordFailure(clientIP, username)
-				// Check 在已达锁定阈值时返回 ErrRateLimited —— 用它区分 login_fail / login_locked
-				locked = errors.Is(rateLimiter.Check(clientIP, username), ErrRateLimited)
 			}
-			// 不手动传 "time" —— slog 已自动加 time=,重复会污染日志解析。
 			logger.Warn("🔐 [LOGIN_FAIL] 登录失败",
 				"username", username,
-				"client_ip", clientIP)
-			// 登录暴破进安全事件流（与 brute_force 的封禁体系独立：只记事件、不进 ip_bans，
-			// 因为限流锁定 ≠ 封禁，生命周期不同）。best-effort，失败静默。
-			if repo != nil {
-				kind := "login_fail"
-				if locked {
-					kind = "login_locked"
-				}
-				_ = repo.InsertSecurityEvent(r.Context(), storage.SecurityEvent{
-					IP: clientIP, Kind: kind, Username: username, Path: r.URL.Path,
-				})
-			}
+				"client_ip", clientIP,
+				"time", time.Now().Format("2006-01-02 15:04:05"))
 			writeError(w, http.StatusUnauthorized, errors.New("invalid credentials"))
 			return
 		}
 
+		// 登录成功，清除速率限制计数
 		if rateLimiter != nil {
 			rateLimiter.RecordSuccess(clientIP, username)
 		}

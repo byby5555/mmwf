@@ -23,7 +23,7 @@ type subscriptionAdminHandler struct {
 	baseDir string
 }
 
-// 返回一个管理订阅链接的仅管理处理程序。
+// NewSubscriptionAdminHandler returns an admin-only handler that manages subscription links.
 func NewSubscriptionAdminHandler(baseDir string, repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
 		panic("subscription admin handler requires repository")
@@ -239,7 +239,7 @@ func (h *subscriptionAdminHandler) persistRuleFile(name string, header *multipar
 		ext = ".yaml"
 	}
 
-	if header.Size > 10<<20 { // 详见上下文
+	if header.Size > 10<<20 { // 10MB
 		return "", errors.New("规则文件大小不可超过 10MB")
 	}
 
@@ -361,8 +361,8 @@ func convertSubscriptions(links []storage.SubscriptionLink) []subscriptionDTO {
 	return result
 }
 
-// NewSubscriptionListHandler 为经过身份验证的用户返回可公开访问的订阅元数据。
-// 对于管理员用户，返回所有订阅。对于普通用户，仅返回分配给他们的订阅。
+// NewSubscriptionListHandler returns publicly accessible subscription metadata for authenticated users.
+// For admin users, returns all subscriptions. For regular users, returns only subscriptions assigned to them.
 func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
 		panic("subscription list handler requires repository")
@@ -374,14 +374,14 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 
-		// 从上下文中获取用户名
+		// Get username from context
 		username := auth.UsernameFromContext(r.Context())
 		if username == "" {
 			writeError(w, http.StatusUnauthorized, errors.New("username not found in context"))
 			return
 		}
 
-		// 让用户检查角色
+		// Get user to check role
 		user, err := repo.GetUser(r.Context(), username)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -390,7 +390,7 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 
 		var files []storage.SubscribeFile
 
-		// 管理员用户可以查看所有订阅
+		// Admin users can see all subscriptions
 		if user.Role == storage.RoleAdmin {
 			files, err = repo.ListSubscribeFiles(r.Context())
 			if err != nil {
@@ -398,83 +398,50 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 				return
 			}
 		} else {
-			// 普通用户只能看到分配给他们的订阅
+			// Regular users can only see subscriptions assigned to them
 			files, err = repo.GetUserSubscriptions(r.Context(), username)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
-
-			// 用户无手动分配的订阅但有套餐时，返回虚拟套餐订阅条目
-			if len(files) == 0 && user.PackageID > 0 {
-				if pkg, pkgErr := repo.GetPackage(r.Context(), user.PackageID); pkgErr == nil {
-					files = []storage.SubscribeFile{{
-						ID:            -1,
-						Name:          pkg.Name,
-						Description:   pkg.Description,
-						Type:          "package",
-						Filename:      "__package__",
-						FileShortCode: pkg.ShortCode,
-						UpdatedAt:     pkg.UpdatedAt,
-					}}
-				}
-			}
-
-			// 追加用户自己创建的订阅(套餐之外用户手动创建的),否则在订阅链接页面看不到
-			seen := make(map[int64]bool, len(files))
-			for _, f := range files {
-				seen[f.ID] = true
-			}
-			if own, oerr := repo.ListSubscribeFiles(r.Context()); oerr == nil {
-				for _, f := range own {
-					if f.CreatedBy == username && !seen[f.ID] {
-						files = append(files, f)
-						seen[f.ID] = true
-					}
-				}
-			}
 		}
 
-		// 从系统设置检查是否全局启用短链接
-		systemConfig, sysErr := repo.GetSystemConfig(r.Context())
-		enableShortLink := true
-		if sysErr == nil {
-			enableShortLink = systemConfig.EnableShortLink
-		}
+		// Get system config to check if short link is enabled (global setting)
+		systemConfig, err := repo.GetSystemConfig(r.Context())
+		enableShortLink := err == nil && systemConfig.EnableShortLink
 
-		// 仅在启用短链接时获取用户短代码(优先用户自定义短码,否则系统自动短码)。
-		// 管理员现在也能编辑自己的 user_short_code(订阅文件 popover 里),所以订阅链接也拼上,
-		// 与普通用户一致 = /x/{fileShortCode}{userShortCode}。short_link.go 会先按整 code 找文件,
-		// 找不到再按"文件短码+用户短码"分裂,所以拼上 admin 自己的短码不影响"全权访问"语义。
+		// Get user short code only if short link is enabled
 		var userShortCode string
 		if enableShortLink {
 			userShortCode, err = repo.GetEffectiveUserShortCode(r.Context(), username)
 			if err != nil {
-				// 如果用户短代码不存在，它将在下次令牌访问时生成
 				userShortCode = ""
 			}
 		}
-		_ = user // role 字段不再用于此处的短码逻辑(保留 user 变量供其他地方使用)
 
 		type item struct {
-			ID              int64     `json:"id"`
-			Name            string    `json:"name"`
-			Description     string    `json:"description"`
-			Filename        string    `json:"filename"`
-			Type            string    `json:"type"`
-			FileShortCode   string    `json:"file_short_code,omitempty"`
-			CustomShortCode string    `json:"custom_short_code,omitempty"`
-			UpdatedAt       time.Time `json:"updated_at"`
-			LatestVersion   int64     `json:"latest_version,omitempty"`
+			ID              int64      `json:"id"`
+			Name            string     `json:"name"`
+			Description     string     `json:"description"`
+			Filename        string     `json:"filename"`
+			Type            string     `json:"type"`
+			FileShortCode   string     `json:"file_short_code,omitempty"`
+			CustomShortCode string     `json:"custom_short_code,omitempty"`
+			RawOutput       bool       `json:"raw_output"`
+			ExpireAt        *time.Time `json:"expire_at,omitempty"`
+			UpdatedAt       time.Time  `json:"updated_at"`
+			LatestVersion   int64      `json:"latest_version,omitempty"`
 		}
 
 		payload := make([]item, 0, len(files))
 		for _, file := range files {
+			// Get latest version for this file
 			var latestVersion int64
 			if versions, err := repo.ListRuleVersions(r.Context(), file.Filename, 1); err == nil && len(versions) > 0 {
 				latestVersion = versions[0].Version
 			}
 
+			// Only include file short code if short link is enabled
 			fileShortCode := ""
 			customShortCode := ""
 			if enableShortLink {
@@ -490,6 +457,8 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 				Type:            file.Type,
 				FileShortCode:   fileShortCode,
 				CustomShortCode: customShortCode,
+				RawOutput:       file.RawOutput,
+				ExpireAt:        file.ExpireAt,
 				UpdatedAt:       file.UpdatedAt,
 				LatestVersion:   latestVersion,
 			})

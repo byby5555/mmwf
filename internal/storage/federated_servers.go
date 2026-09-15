@@ -9,12 +9,7 @@ import (
 // federated_servers(消费方侧):标记某台 remote_server 实为"接入的分享服务器",
 // 记录拥有方主控 URL 与分享令牌。forwardToRemoteServer 据此把远程操作改走联邦转发。
 
-type FederatedServer struct {
-	ServerID   int64  `json:"server_id"`
-	OwnerURL   string `json:"owner_url"`
-	ShareToken string `json:"share_token"`
-	Prefix     string `json:"prefix"` // 消费方在该分享服务器上新增入站时统一加的 tag 前缀
-}
+// 消费方在该分享服务器上新增入站时统一加的 tag 前缀
 
 func (r *TrafficRepository) ensureFederatedServersTable(ctx context.Context) error {
 	if r == nil || r.db == nil {

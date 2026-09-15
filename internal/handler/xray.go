@@ -9,10 +9,6 @@ import (
 
 	"miaomiaowux/internal/auth"
 	"miaomiaowux/internal/storage"
-	"miaomiaowux/internal/xrpc/client"
-	"miaomiaowux/internal/xrpc/services/handler"
-
-	statspb "github.com/xtls/xray-core/app/stats/command"
 )
 
 type XrayHandler struct {
@@ -29,18 +25,19 @@ func NewXrayHandler(repo *storage.TrafficRepository) *XrayHandler {
 	}
 }
 
-// XrayClient 表示与 Xray gRPC API 的连接
+// XrayClient 表示与 sing-box Clash API 的连接
 type XrayClient struct {
-	*client.Clients
+	apiURL string
+	client *stdhttp.Client
 }
 
-// 建立与 Xray 实例的连接
+// 建立与 sing-box Clash API 的连接
 func (h *XrayHandler) ConnectToXray(ctx context.Context, host string, port int) (*XrayClient, error) {
-	clients, err := client.New(ctx, host, uint16(port))
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to Xray at %s:%d: %w", host, port, err)
-	}
-	return &XrayClient{Clients: clients}, nil
+	apiURL := fmt.Sprintf("http://%s:%d", host, port)
+	return &XrayClient{
+		apiURL: apiURL,
+		client: &stdhttp.Client{Timeout: 10 * time.Second},
+	}, nil
 }
 
 // 请求/响应结构
@@ -83,9 +80,9 @@ type StatsResponse struct {
 }
 
 type SystemStatsResponse struct {
-	Success bool                      `json:"success"`
-	Message string                    `json:"message"`
-	Stats   *statspb.SysStatsResponse `json:"stats,omitempty"`
+	Success bool                   `json:"success"`
+	Message string                 `json:"message"`
+	Stats   map[string]interface{} `json:"stats,omitempty"`
 }
 
 // HTTP 处理程序
@@ -109,43 +106,21 @@ func (h *XrayHandler) AddOutbound(w stdhttp.ResponseWriter, r *stdhttp.Request) 
 		return
 	}
 
-	// 从用户设置获取 Xray 连接设置或使用默认值
+	// 从用户设置获取连接设置或使用默认值
 	xrayHost, xrayPort, err := h.getXraySettings(ctx, username)
 	if err != nil {
 		stdhttp.Error(w, err.Error(), stdhttp.StatusInternalServerError)
 		return
 	}
 
-	client, err := h.ConnectToXray(ctx, xrayHost, xrayPort)
-	if err != nil {
-		h.writeErrorResponse(w, "Failed to connect to Xray", err)
-		return
-	}
-	defer client.Connection.Close()
+	// sing-box 使用配置文件管理出站，Clash API 不直接支持添加出站
+	_ = xrayHost
+	_ = xrayPort
 
-	var addErr error
-	switch req.Type {
-	case "freedom":
-		addErr = handler.AddFreedomOutbound(ctx, client.Handler, req.Tag)
-	case "blackhole":
-		addErr = handler.AddBlackholeOutbound(ctx, client.Handler, req.Tag)
-	case "http":
-		addErr = handler.AddHTTPOutbound(ctx, client.Handler, req.Tag)
-	case "socks":
-		addErr = handler.AddSocksOutbound(ctx, client.Handler, req.Tag)
-	default:
-		stdhttp.Error(w, "Unsupported outbound type: "+req.Type, stdhttp.StatusBadRequest)
-		return
-	}
-
+	// 这里返回提示信息，实际出站管理通过配置文件操作
 	response := AddOutboundResponse{
-		Success: addErr == nil,
-		Message: func() string {
-			if addErr != nil {
-				return addErr.Error()
-			}
-			return "Outbound added successfully"
-		}(),
+		Success: false,
+		Message: "Outbound management via Clash API is not supported in sing-box mode. Use config file operations instead.",
 	}
 
 	h.writeJSONResponse(w, response)
@@ -175,29 +150,9 @@ func (h *XrayHandler) RemoveOutbound(w stdhttp.ResponseWriter, r *stdhttp.Reques
 		return
 	}
 
-	// 获取 Xray 连接设置
-	xrayHost, xrayPort, err := h.getXraySettings(ctx, username)
-	if err != nil {
-		stdhttp.Error(w, err.Error(), stdhttp.StatusInternalServerError)
-		return
-	}
-
-	client, err := h.ConnectToXray(ctx, xrayHost, xrayPort)
-	if err != nil {
-		h.writeErrorResponse(w, "Failed to connect to Xray", err)
-		return
-	}
-	defer client.Connection.Close()
-
-	err = handler.RemoveOutbound(ctx, client.Handler, req.Tag)
 	response := AddOutboundResponse{
-		Success: err == nil,
-		Message: func() string {
-			if err != nil {
-				return err.Error()
-			}
-			return "Outbound removed successfully"
-		}(),
+		Success: false,
+		Message: "Outbound management via Clash API is not supported in sing-box mode. Use config file operations instead.",
 	}
 
 	h.writeJSONResponse(w, response)
@@ -216,39 +171,46 @@ func (h *XrayHandler) ListOutbounds(w stdhttp.ResponseWriter, r *stdhttp.Request
 		return
 	}
 
-	// 获取 Xray 连接设置
+	// 获取连接设置
 	xrayHost, xrayPort, err := h.getXraySettings(ctx, username)
 	if err != nil {
 		stdhttp.Error(w, err.Error(), stdhttp.StatusInternalServerError)
 		return
 	}
 
-	client, err := h.ConnectToXray(ctx, xrayHost, xrayPort)
+	xrayClient, err := h.ConnectToXray(ctx, xrayHost, xrayPort)
 	if err != nil {
-		h.writeErrorResponse(w, "Failed to connect to Xray", err)
+		h.writeErrorResponse(w, "Failed to connect to Clash API", err)
 		return
 	}
-	defer client.Connection.Close()
 
-	tags, err := handler.ListInboundTags(ctx, client.Handler)
+	// 通过 Clash API 获取出站列表
+	url := fmt.Sprintf("%s/proxies", xrayClient.apiURL)
+	httpReq, _ := stdhttp.NewRequestWithContext(ctx, "GET", url, nil)
+	resp, err := xrayClient.client.Do(httpReq)
+	if err != nil {
+		h.writeErrorResponse(w, "Failed to query Clash API", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var apiResp struct {
+		Proxies map[string]interface{} `json:"proxies"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		h.writeErrorResponse(w, "Failed to decode Clash API response", err)
+		return
+	}
+
+	outbounds := make([]OutboundInfo, 0, len(apiResp.Proxies))
+	for tag := range apiResp.Proxies {
+		outbounds = append(outbounds, OutboundInfo{Tag: tag})
+	}
+
 	response := ListOutboundsResponse{
-		Success: err == nil,
-		Message: func() string {
-			if err != nil {
-				return err.Error()
-			}
-			return "Success"
-		}(),
-		Outbounds: func() []OutboundInfo {
-			if tags == nil {
-				return []OutboundInfo{}
-			}
-			result := make([]OutboundInfo, len(tags))
-			for i, tag := range tags {
-				result[i] = OutboundInfo{Tag: tag}
-			}
-			return result
-		}(),
+		Success:   true,
+		Message:   "Success",
+		Outbounds: outbounds,
 	}
 
 	h.writeJSONResponse(w, response)
@@ -278,40 +240,51 @@ func (h *XrayHandler) GetStats(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		return
 	}
 
-	// 获取 Xray 连接设置
+	// 获取连接设置
 	xrayHost, xrayPort, err := h.getXraySettings(ctx, username)
 	if err != nil {
 		stdhttp.Error(w, err.Error(), stdhttp.StatusInternalServerError)
 		return
 	}
 
-	client, err := h.ConnectToXray(ctx, xrayHost, xrayPort)
+	xrayClient, err := h.ConnectToXray(ctx, xrayHost, xrayPort)
 	if err != nil {
-		h.writeErrorResponse(w, "Failed to connect to Xray", err)
+		h.writeErrorResponse(w, "Failed to connect to Clash API", err)
 		return
 	}
-	defer client.Connection.Close()
 
-	// 使用 gRPC 查询统计信息
-	statsResp, err := client.Stats.QueryStats(ctx, &statspb.QueryStatsRequest{
-		Pattern: req.Name,
-		Reset_:  req.Reset,
-	})
+	// 通过 Clash API 获取连接统计
+	url := fmt.Sprintf("%s/connections", xrayClient.apiURL)
+	httpReq, _ := stdhttp.NewRequestWithContext(ctx, "GET", url, nil)
+	resp, err := xrayClient.client.Do(httpReq)
+	if err != nil {
+		h.writeErrorResponse(w, "Failed to query Clash API", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var apiResp struct {
+		Upload   int64 `json:"uploadTotal"`
+		Download int64 `json:"downloadTotal"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		h.writeErrorResponse(w, "Failed to decode Clash API response", err)
+		return
+	}
 
 	var value int64
-	if statsResp != nil && len(statsResp.Stat) > 0 {
-		value = statsResp.Stat[0].Value
+	if req.Name == "upload" || req.Name == "up" {
+		value = apiResp.Upload
+	} else if req.Name == "download" || req.Name == "down" {
+		value = apiResp.Download
+	} else {
+		value = apiResp.Upload + apiResp.Download
 	}
 
 	response := StatsResponse{
-		Success: err == nil,
-		Message: func() string {
-			if err != nil {
-				return err.Error()
-			}
-			return "Success"
-		}(),
-		Value: value,
+		Success: true,
+		Message: "Success",
+		Value:   value,
 	}
 
 	h.writeJSONResponse(w, response)
@@ -330,30 +303,39 @@ func (h *XrayHandler) GetSystemStats(w stdhttp.ResponseWriter, r *stdhttp.Reques
 		return
 	}
 
-	// 获取 Xray 连接设置
+	// 获取连接设置
 	xrayHost, xrayPort, err := h.getXraySettings(ctx, username)
 	if err != nil {
 		stdhttp.Error(w, err.Error(), stdhttp.StatusInternalServerError)
 		return
 	}
 
-	client, err := h.ConnectToXray(ctx, xrayHost, xrayPort)
+	xrayClient, err := h.ConnectToXray(ctx, xrayHost, xrayPort)
 	if err != nil {
-		h.writeErrorResponse(w, "Failed to connect to Xray", err)
+		h.writeErrorResponse(w, "Failed to connect to Clash API", err)
 		return
 	}
-	defer client.Connection.Close()
 
-	sysStats, err := client.Stats.GetSysStats(ctx, &statspb.SysStatsRequest{})
+	// 通过 Clash API 获取系统统计
+	url := fmt.Sprintf("%s/connections", xrayClient.apiURL)
+	httpReq, _ := stdhttp.NewRequestWithContext(ctx, "GET", url, nil)
+	resp, err := xrayClient.client.Do(httpReq)
+	if err != nil {
+		h.writeErrorResponse(w, "Failed to query Clash API", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var stats map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		h.writeErrorResponse(w, "Failed to decode Clash API response", err)
+		return
+	}
+
 	response := SystemStatsResponse{
-		Success: err == nil,
-		Message: func() string {
-			if err != nil {
-				return err.Error()
-			}
-			return "Success"
-		}(),
-		Stats: sysStats,
+		Success: true,
+		Message: "Success",
+		Stats:   stats,
 	}
 
 	h.writeJSONResponse(w, response)
@@ -362,20 +344,17 @@ func (h *XrayHandler) GetSystemStats(w stdhttp.ResponseWriter, r *stdhttp.Reques
 // 辅助函数
 
 func (h *XrayHandler) getXraySettings(ctx context.Context, username string) (string, int, error) {
-	// 默认设置
+	// 默认设置 — sing-box Clash API 默认端口 9090
 	defaultHost := "127.0.0.1"
-	defaultPort := 10085
+	defaultPort := 9090
 
 	if h.repo == nil {
 		return defaultHost, defaultPort, nil
 	}
 
-	// 从用户设置中解析 Xray 设置或使用默认值
-	// 您可以扩展 UserSettings 结构以包含 XrayHost 和 XrayPort
 	host := defaultHost
 	port := defaultPort
 
-	// 目前，使用默认值，但您可以扩展它以从设置中读取
 	return host, port, nil
 }
 

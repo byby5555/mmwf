@@ -80,7 +80,7 @@ func (h *AddSharedServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		IPAddress: ip,
 		XrayMode:  xrayMode,
 	}
-	if err := h.repo.CreateRemoteServer(r.Context(), server); err != nil {
+	if _, err := h.repo.CreateRemoteServer(r.Context(), server); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

@@ -25,7 +25,7 @@ func NewRuleEditorHandler(baseDir string, repo *storage.TrafficRepository) http.
 	handler := &RuleEditorHandler{
 		repo:      repo,
 		baseDir:   baseDir,
-		readLimit: 5 << 20, // 每个请求 5MB
+		readLimit: 5 << 20, // 5MB per request
 	}
 	return handler
 }

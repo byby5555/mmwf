@@ -10,51 +10,49 @@ import (
 	"sync"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
 	"miaomiaowux/internal/util"
 
 	"gopkg.in/yaml.v3"
 )
 
-// TempSubscription代表临时订阅
+// TempSubscription represents a temporary subscription
 type TempSubscription struct {
-	ID          string    `json:"id"`
-	Proxies     []any     `json:"proxies"`
-	MaxAccess   int       `json:"max_access"`
-	AccessCount int       `json:"access_count"`
-	ExpireAt    time.Time `json:"expire_at"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID           string    `json:"id"`
+	Proxies      []any     `json:"proxies"`
+	MaxAccess    int       `json:"max_access"`
+	AccessCount  int       `json:"access_count"`
+	ExpireAt     time.Time `json:"expire_at"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
-// TempSubscriptionStore 管理内存中的临时订阅
+// TempSubscriptionStore manages temporary subscriptions in memory
 type TempSubscriptionStore struct {
 	mu            sync.RWMutex
 	subscriptions map[string]*TempSubscription
 }
 
-// 临时订阅的全球商店
+// Global store for temporary subscriptions
 var tempSubStore = &TempSubscriptionStore{
 	subscriptions: make(map[string]*TempSubscription),
 }
 
-// generateShortCode 生成随机 8 个字符的十六进制代码
+// generateShortCode generates a random 8-character hex code
 func generateTempSubCode() string {
 	bytes := make([]byte, 4)
 	rand.Read(bytes)
 	return hex.EncodeToString(bytes)
 }
 
-// 创建一个新的临时订阅
+// Create creates a new temporary subscription
 func (s *TempSubscriptionStore) Create(proxies []any, maxAccess int, expireSeconds int) *TempSubscription {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 清理过期订阅
+	// Clean up expired subscriptions
 	s.cleanupLocked()
 
 	id := generateTempSubCode()
-	// 确保唯一ID
+	// Ensure unique ID
 	for s.subscriptions[id] != nil {
 		id = generateTempSubCode()
 	}
@@ -72,7 +70,7 @@ func (s *TempSubscriptionStore) Create(proxies []any, maxAccess int, expireSecon
 	return sub
 }
 
-// 通过 ID 检索临时订阅并增加访问计数
+// Get retrieves a temporary subscription by ID and increments access count
 func (s *TempSubscriptionStore) Get(id string) (*TempSubscription, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -82,22 +80,22 @@ func (s *TempSubscriptionStore) Get(id string) (*TempSubscription, error) {
 		return nil, errors.New("subscription not found")
 	}
 
-	// 检查是否过期
+	// Check if expired
 	if time.Now().After(sub.ExpireAt) {
 		delete(s.subscriptions, id)
 		return nil, errors.New("subscription expired")
 	}
 
-	// 检查是否达到最大访问权限
+	// Check if max access reached
 	if sub.AccessCount >= sub.MaxAccess {
 		delete(s.subscriptions, id)
 		return nil, errors.New("subscription access limit reached")
 	}
 
-	// 增加访问计数
+	// Increment access count
 	sub.AccessCount++
 
-	// 如果这是最后一次允许的访问，请将其删除
+	// If this was the last allowed access, delete it
 	if sub.AccessCount >= sub.MaxAccess {
 		delete(s.subscriptions, id)
 	}
@@ -105,7 +103,7 @@ func (s *TempSubscriptionStore) Get(id string) (*TempSubscription, error) {
 	return sub, nil
 }
 
-// 删除过期的订阅（必须在持有锁的情况下调用）
+// cleanupLocked removes expired subscriptions (must be called with lock held)
 func (s *TempSubscriptionStore) cleanupLocked() {
 	now := time.Now()
 	for id, sub := range s.subscriptions {
@@ -115,40 +113,15 @@ func (s *TempSubscriptionStore) cleanupLocked() {
 	}
 }
 
-// TempSubscriptionHandler 处理临时订阅请求
-type TempSubscriptionHandler struct {
-	repo *storage.TrafficRepository
-}
+// TempSubscriptionHandler handles temporary subscription requests
+type TempSubscriptionHandler struct{}
 
-// 为临时订阅创建新的处理程序
-func NewTempSubscriptionHandler(repo *storage.TrafficRepository) http.Handler {
-	return &TempSubscriptionHandler{repo: repo}
+// NewTempSubscriptionHandler creates a new handler for temporary subscriptions
+func NewTempSubscriptionHandler() http.Handler {
+	return &TempSubscriptionHandler{}
 }
 
 func (h *TempSubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 权限:admin 直接放行;普通用户必须节点管理(nodes 页面)对其开放,
-	// 跟节点页"生成临时订阅"按钮的可见性保持一致 — 后端是 source of truth。
-	ctx := r.Context()
-	username := auth.UsernameFromContext(ctx)
-	if username == "" {
-		writeError(w, http.StatusUnauthorized, errors.New("unauthorized"))
-		return
-	}
-	if !userIsAdmin(ctx, h.repo, username) {
-		cfg := loadUserPermConfig(ctx, h.repo)
-		allowed := false
-		for _, p := range cfg.Pages {
-			if p == "nodes" {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			writeError(w, http.StatusForbidden, errors.New("无权限:请联系管理员在妙妙屋功能中开启节点管理"))
-			return
-		}
-	}
-
 	switch r.Method {
 	case http.MethodPost:
 		h.handleCreate(w, r)
@@ -157,14 +130,14 @@ func (h *TempSubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-// CreateTempSubRequest 表示创建临时订阅的请求
+// CreateTempSubRequest represents the request to create a temporary subscription
 type CreateTempSubRequest struct {
 	Proxies       []any `json:"proxies"`
 	MaxAccess     int   `json:"max_access"`
 	ExpireSeconds int   `json:"expire_seconds"`
 }
 
-// CreateTempSubResponse 表示创建临时订阅后的响应
+// CreateTempSubResponse represents the response after creating a temporary subscription
 type CreateTempSubResponse struct {
 	ID        string    `json:"id"`
 	URL       string    `json:"url"`
@@ -184,7 +157,7 @@ func (h *TempSubscriptionHandler) handleCreate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 设置默认值
+	// Set defaults
 	if req.MaxAccess <= 0 {
 		req.MaxAccess = 1
 	}
@@ -192,12 +165,12 @@ func (h *TempSubscriptionHandler) handleCreate(w http.ResponseWriter, r *http.Re
 		req.ExpireSeconds = 60
 	}
 
-	// 限制最大值以确保安全
+	// Limit max values for security
 	if req.MaxAccess > 100 {
 		req.MaxAccess = 100
 	}
 	if req.ExpireSeconds > 3600 {
-		req.ExpireSeconds = 3600 // 最多 1 小时
+		req.ExpireSeconds = 3600 // Max 1 hour
 	}
 
 	sub := tempSubStore.Create(req.Proxies, req.MaxAccess, req.ExpireSeconds)
@@ -213,10 +186,10 @@ func (h *TempSubscriptionHandler) handleCreate(w http.ResponseWriter, r *http.Re
 	json.NewEncoder(w).Encode(resp)
 }
 
-// TempSubscriptionAccessHandler 处理对临时订阅的访问
+// TempSubscriptionAccessHandler handles access to temporary subscriptions
 type TempSubscriptionAccessHandler struct{}
 
-// 创建用于访问临时订阅的处理程序
+// NewTempSubscriptionAccessHandler creates a handler for accessing temporary subscriptions
 func NewTempSubscriptionAccessHandler() http.Handler {
 	return &TempSubscriptionAccessHandler{}
 }
@@ -227,14 +200,14 @@ func (h *TempSubscriptionAccessHandler) ServeHTTP(w http.ResponseWriter, r *http
 		return
 	}
 
-	// 验证用户代理：必须包含 ClashMetaForAndroid 或 Mihomo（不区分大小写）
+	// Validate User-Agent: must contain ClashMetaForAndroid or Mihomo (case-insensitive)
 	userAgent := strings.ToLower(r.Header.Get("User-Agent"))
 	if !strings.Contains(userAgent, "clashmetaforandroid") && !strings.Contains(userAgent, "mihomo") {
 		http.Error(w, "Invalid client", http.StatusForbidden)
 		return
 	}
 
-	// 从 URL 路径中提取 ID：/t/{id}
+	// Extract ID from URL path: /t/{id}
 	path := strings.TrimPrefix(r.URL.Path, "/t/")
 	id := strings.TrimSuffix(path, "/")
 
@@ -249,12 +222,12 @@ func (h *TempSubscriptionAccessHandler) ServeHTTP(w http.ResponseWriter, r *http
 		return
 	}
 
-	// 使用 yaml.Node 构建具有有序代理属性的 YAML
+	// Build YAML with ordered proxy properties using yaml.Node
 	rootNode := &yaml.Node{
 		Kind: yaml.MappingNode,
 	}
 
-	// 添加“代理”键
+	// Add "proxies" key
 	proxiesKeyNode := &yaml.Node{Kind: yaml.ScalarNode, Value: "proxies"}
 	proxiesListNode := &yaml.Node{Kind: yaml.SequenceNode}
 
@@ -272,7 +245,7 @@ func (h *TempSubscriptionAccessHandler) ServeHTTP(w http.ResponseWriter, r *http
 		return
 	}
 
-	// 修复 YAML 输出中的表情符号转义序列
+	// Fix emoji escape sequences in YAML output
 	result := RemoveUnicodeEscapeQuotes(string(yamlData))
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")

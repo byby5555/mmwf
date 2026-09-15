@@ -3,21 +3,11 @@ package storage
 import (
 	"context"
 	"database/sql"
-	"time"
 )
 
 // Announcement 公告实例(announcements 表一行)。
-type Announcement struct {
-	ID         int64      `json:"id"`
-	Type       string     `json:"type"`
-	Title      string     `json:"title"`
-	Body       string     `json:"body"`
-	NodeID     int64      `json:"node_id,omitempty"` // 被墙/恢复公告关联的节点(0=无关联)
-	ViaBot     bool       `json:"via_bot"`
-	ViaMiniapp bool       `json:"via_miniapp"`
-	CreatedAt  time.Time  `json:"created_at"`
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
-}
+
+// 被墙/恢复公告关联的节点(0=无关联)
 
 // CreateAnnouncement 插入一条公告,返回自增 id。expiresAt 为 nil 表示永不过期。
 func (r *TrafficRepository) CreateAnnouncement(ctx context.Context, a Announcement) (int64, error) {
@@ -79,13 +69,6 @@ func (r *TrafficRepository) DeleteAnnouncement(ctx context.Context, id int64) er
 }
 
 // ===== 节点可达状态(被墙探测)=====
-
-type NodeReachability struct {
-	NodeID           int64
-	Reachable        bool
-	ConsecutiveFail  int
-	AnnouncedBlocked bool
-}
 
 // GetNodeReachability 取节点当前可达状态;第二返回值 false = 无记录(视作首次、默认可达)。
 func (r *TrafficRepository) GetNodeReachability(ctx context.Context, nodeID int64) (NodeReachability, bool, error) {

@@ -16,7 +16,7 @@ type ruleMetadataHandler struct {
 	baseDir string
 }
 
-// 公开所选文件的最新规则版本信息。
+// NewRuleMetadataHandler exposes latest rule version information for select files.
 func NewRuleMetadataHandler(baseDir string, repo *storage.TrafficRepository) http.Handler {
 	if baseDir == "" {
 		panic("rule metadata handler requires base directory")

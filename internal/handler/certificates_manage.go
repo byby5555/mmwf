@@ -256,7 +256,7 @@ func (h *CertificateHandler) GetCertificate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	resp := certificateToResponse(cert)
+	resp := certificateToResponse(&cert)
 	if cert.RemoteServerID > 0 {
 		server, _ := h.repo.GetRemoteServer(ctx, cert.RemoteServerID)
 		if server != nil {
@@ -335,7 +335,7 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 		AutoDeploy:     req.AutoDeploy,
 	}
 
-	if err := h.repo.CreateCertificate(ctx, cert); err != nil {
+	if _, err := h.repo.CreateCertificate(ctx, cert); err != nil {
 		if err == storage.ErrCertificateExists {
 			respondJSON(w, http.StatusConflict, map[string]any{"success": false, "message": "该域名的证书已存在"})
 			return
@@ -526,9 +526,9 @@ func (h *CertificateHandler) RenewCertificate(w http.ResponseWriter, r *http.Req
 	_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusPending, "正在续期...")
 
 	if cert.RemoteServerID == 0 {
-		go h.renewLocalCertificate(cert)
+		go h.renewLocalCertificate(&cert)
 	} else {
-		go h.requestRemoteCertificate(cert)
+		go h.requestRemoteCertificate(&cert)
 	}
 
 	respondJSON(w, http.StatusAccepted, map[string]any{"success": true, "message": "证书续期已提交"})
@@ -1073,7 +1073,7 @@ func (h *CertificateHandler) DeployCertificate(w http.ResponseWriter, r *http.Re
 	cert.DeployTarget = req.DeployTarget
 	cert.DeployCertPath = req.DeployCertPath
 	cert.DeployKeyPath = req.DeployKeyPath
-	if err := h.repo.UpdateCertificate(r.Context(), cert); err != nil {
+	if err := h.repo.UpdateCertificate(r.Context(), &cert); err != nil {
 		log.Printf("[Certificate] UpdateCertificate deploy settings failed: %v", err)
 	}
 
@@ -1174,7 +1174,7 @@ func (h *CertificateHandler) CreateDNSProvider(w http.ResponseWriter, r *http.Re
 		Credentials:  req.Credentials,
 	}
 
-	if err := h.repo.CreateDNSProvider(ctx, p); err != nil {
+	if _, err := h.repo.CreateDNSProvider(ctx, p); err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("创建DNS提供商失败: %v", err)})
 		return
 	}
@@ -1340,7 +1340,7 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 		DeployKeyPath:  deployKeyPath,
 	}
 
-	if err := h.repo.CreateCertificate(ctx, cert); err != nil {
+	if _, err := h.repo.CreateCertificate(ctx, cert); err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("创建证书记录失败: %v", err)})
 		return
 	}

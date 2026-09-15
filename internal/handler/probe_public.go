@@ -152,7 +152,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		online := (h.wsHandler != nil && h.wsHandler.IsConnected(s.Token)) || s.Status == "connected"
 		ps := probeServer{Online: online}
 		if onSpeed {
-			up, down := s.CurrentUploadSpeed, s.CurrentDownloadSpeed
+			up, down := int64(s.CurrentUploadSpeed), int64(s.CurrentDownloadSpeed)
 			ps.UploadSpeed, ps.DownloadSpeed = &up, &down
 		}
 		if onTraffic {

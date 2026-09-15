@@ -67,7 +67,7 @@ func (h *DDNSAdminHandler) handleStatus(w http.ResponseWriter, r *http.Request, 
 	}
 	// 拼一个 DNS provider 名(若已配置 + 有匹配)给 Tooltip 显示用
 	providerName := ""
-	providerID := server.DDNSProviderID
+	providerID := int64(server.DDNSProviderID)
 	if providerID == 0 && server.DDNSEnabled {
 		// 自动模式 — 查匹配证书
 		if cert, cerr := h.repo.FindCertificateForDomain(r.Context(), server.PullAddress); cerr == nil {

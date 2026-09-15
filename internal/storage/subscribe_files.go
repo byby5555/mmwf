@@ -423,3 +423,55 @@ func (r *TrafficRepository) GetUserPackageSubscription(ctx context.Context, user
 	return file, nil
 }
 
+// GetSubscribeFilesWithTemplate 获取所有绑定了模板的订阅文件
+func (r *TrafficRepository) GetSubscribeFilesWithTemplate(ctx context.Context) ([]SubscribeFile, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT `+subscribeFileSelectCols+` FROM subscribe_files WHERE template_filename IS NOT NULL AND template_filename != '' ORDER BY sort_order ASC, created_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("get subscribe files with template: %w", err)
+	}
+	defer rows.Close()
+	var files []SubscribeFile
+	for rows.Next() {
+		file, err := scanSubscribeFile(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan subscribe file: %w", err)
+		}
+		files = append(files, file)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate subscribe files with template: %w", err)
+	}
+	return files, nil
+}
+
+// GetSubscribeFilesByTemplate 获取绑定了指定模板的所有订阅文件
+func (r *TrafficRepository) GetSubscribeFilesByTemplate(ctx context.Context, templateFilename string) ([]SubscribeFile, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	templateFilename = strings.TrimSpace(templateFilename)
+	if templateFilename == "" {
+		return nil, errors.New("template filename is required")
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT `+subscribeFileSelectCols+` FROM subscribe_files WHERE template_filename = ? ORDER BY sort_order ASC, created_at DESC`, templateFilename)
+	if err != nil {
+		return nil, fmt.Errorf("get subscribe files by template: %w", err)
+	}
+	defer rows.Close()
+	var files []SubscribeFile
+	for rows.Next() {
+		file, err := scanSubscribeFile(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan subscribe file: %w", err)
+		}
+		files = append(files, file)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate subscribe files: %w", err)
+	}
+	return files, nil
+}
+

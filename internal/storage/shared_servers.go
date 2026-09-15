@@ -4,19 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"time"
 )
 
 // shared_servers: 拥有方把某台 remote_server 分享给其他妙妙屋X主控的令牌记录。
 // 分享令牌明文只在创建时返回一次,库里只存 sha256 哈希。
-
-type SharedServer struct {
-	ID        int64      `json:"id"`
-	ServerID  int64      `json:"server_id"`
-	Label     string     `json:"label"`
-	CreatedAt time.Time  `json:"created_at"`
-	RevokedAt *time.Time `json:"revoked_at,omitempty"`
-}
 
 func (r *TrafficRepository) ensureSharedServersTable(ctx context.Context) error {
 	if r == nil || r.db == nil {

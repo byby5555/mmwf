@@ -95,6 +95,14 @@ func (n *Notifier) CheckEnabled(eventType EventType) (bool, SkipReason) {
 		on = n.cfg.NotifyDeviceLimitExceeded
 	case EventIPBan:
 		on = n.cfg.NotifyIPBan
+	case EventNodeProbeOffline:
+		on = n.cfg.NotifyNodeProbeOffline
+	case EventNodeProbeOnline:
+		on = n.cfg.NotifyNodeProbeOnline
+	case EventExpiry:
+		on = n.cfg.NotifyExpiry
+	case EventSilentMode:
+		on = n.cfg.NotifySilentMode
 	default:
 		on = false
 	}

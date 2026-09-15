@@ -3,15 +3,16 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/storage"
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
+	"gopkg.in/yaml.v3"
+	"miaomiaowux/internal/storage"
 )
 
 type templateRequest struct {
@@ -31,7 +32,6 @@ type templateResponse struct {
 	RuleSource       string `json:"rule_source"`
 	UseProxy         bool   `json:"use_proxy"`
 	EnableIncludeAll bool   `json:"enable_include_all"`
-	CreatedBy        string `json:"created_by"`
 	CreatedAt        string `json:"created_at"`
 	UpdatedAt        string `json:"updated_at"`
 }
@@ -49,7 +49,7 @@ type convertRulesResponse struct {
 	Content string `json:"content"`
 }
 
-// 处理模板列表和创建操作
+// NewTemplatesHandler handles template list and create operations
 func NewTemplatesHandler(repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
 		panic("templates handler requires repository")
@@ -67,14 +67,14 @@ func NewTemplatesHandler(repo *storage.TrafficRepository) http.Handler {
 	})
 }
 
-// 处理单个模板操作（GET、PUT、DELETE）
+// NewTemplateHandler handles single template operations (GET, PUT, DELETE)
 func NewTemplateHandler(repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
 		panic("template handler requires repository")
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 从 URL 路径中提取模板 ID
+		// Extract template ID from URL path
 		path := strings.TrimPrefix(r.URL.Path, "/api/admin/templates/")
 		idStr := strings.TrimSpace(path)
 		if idStr == "" {
@@ -101,7 +101,7 @@ func NewTemplateHandler(repo *storage.TrafficRepository) http.Handler {
 	})
 }
 
-// 处理规则转换
+// NewTemplateConvertHandler handles rule conversion
 func NewTemplateConvertHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -124,7 +124,7 @@ func NewTemplateConvertHandler() http.Handler {
 			req.Category = "clash"
 		}
 
-		// 从 URL 获取模板内容
+		// Fetch template content from URL
 		var templateContent string
 		if req.TemplateURL != "" {
 			content, err := fetchRemoteContent(req.TemplateURL, 30*time.Second)
@@ -135,14 +135,14 @@ func NewTemplateConvertHandler() http.Handler {
 			templateContent = content
 		}
 
-		// 检测模板类型并验证
+		// Detect template type and validate
 		detectedType := substore.DetectTemplateType(templateContent)
 		if detectedType != "" && detectedType != req.Category {
 			writeError(w, http.StatusBadRequest, errors.New("template type mismatch: detected "+detectedType+" but requested "+req.Category))
 			return
 		}
 
-		// 如果为空则使用默认模板
+		// Use default template if empty
 		if strings.TrimSpace(templateContent) == "" {
 			if req.Category == "surge" {
 				templateContent = substore.GetDefaultSurgeTemplate()
@@ -151,14 +151,14 @@ func NewTemplateConvertHandler() http.Handler {
 			}
 		}
 
-		// 获取 ACL 配置
+		// Fetch ACL configuration
 		aclContent, err := fetchRemoteContent(req.RuleSource, 30*time.Second)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, errors.New("failed to fetch rule source: "+err.Error()))
 			return
 		}
 
-		// 解析ACL配置
+		// Parse ACL configuration
 		rulesets, proxyGroups := substore.ParseACLConfig(aclContent)
 
 		// 处理req.ProxyNames里的特殊字符
@@ -170,7 +170,7 @@ func NewTemplateConvertHandler() http.Handler {
 			}
 		}
 
-		// 根据类别生成代理组和规则
+		// Generate proxy groups and rules based on category
 		var finalContent string
 		if req.Category == "surge" {
 			proxyGroupsStr := substore.GenerateSurgeProxyGroups(proxyGroups, req.EnableIncludeAll)
@@ -188,6 +188,11 @@ func NewTemplateConvertHandler() http.Handler {
 				return
 			}
 			finalContent = substore.MergeToClashTemplate(templateContent, proxyGroupsStr, rulesStr, providersStr)
+			finalContent, err = ensureV2ProxyGroupMembers(finalContent, req.ProxyNames)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -195,15 +200,65 @@ func NewTemplateConvertHandler() http.Handler {
 	})
 }
 
+// ensureV2ProxyGroupMembers prevents a malformed or expired ACL source from
+// silently producing a Clash config whose groups cannot select any node.
+func ensureV2ProxyGroupMembers(content string, proxyNames []string) (string, error) {
+	trimmed := strings.TrimSpace(strings.ToLower(content))
+	if strings.HasPrefix(trimmed, "<!doctype html") || strings.HasPrefix(trimmed, "<html") {
+		return "", errors.New("规则源返回了 HTML 页面而不是 ACL 配置，请检查模板 URL 是否需要登录或已经失效")
+	}
+	var config map[string]any
+	if err := yaml.Unmarshal([]byte(content), &config); err != nil {
+		return "", fmt.Errorf("V2 模板生成了无效 YAML: %w", err)
+	}
+	groups, ok := config["proxy-groups"].([]any)
+	if !ok || len(groups) == 0 {
+		return "", errors.New("规则源中没有有效的 custom_proxy_group，请检查模板 URL 是否返回了 HTML、登录页或已失效")
+	}
+	if len(proxyNames) == 0 {
+		return "", errors.New("没有可注入代理组的节点")
+	}
+
+	changed := false
+	for _, raw := range groups {
+		group, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		proxies, hasProxies := group["proxies"].([]any)
+		filter, _ := group["filter"].(string)
+		hasDynamicSource := group["include-all"] == true || strings.TrimSpace(filter) != "" || nonEmptyList(group["use"])
+		if (!hasProxies || len(proxies) == 0) && !hasDynamicSource {
+			members := make([]any, 0, len(proxyNames))
+			for _, name := range proxyNames {
+				members = append(members, strings.Trim(name, `"`))
+			}
+			group["proxies"] = members
+			changed = true
+		}
+	}
+	if !changed {
+		return content, nil
+	}
+	result, err := yaml.Marshal(config)
+	if err != nil {
+		return "", fmt.Errorf("序列化 V2 模板失败: %w", err)
+	}
+	return string(result), nil
+}
+
+func nonEmptyList(value any) bool {
+	items, ok := value.([]any)
+	return ok && len(items) > 0
+}
+
 func handleListTemplates(w http.ResponseWriter, r *http.Request, repo *storage.TrafficRepository) {
-	ctx := r.Context()
-	templates, err := repo.ListTemplates(ctx)
+	templates, err := repo.ListTemplates(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
-	// 模板无敏感信息:所有用户可见并可使用全部模板(删除/修改仍仅限自己的,见对应 handler)。
 	response := make([]templateResponse, 0, len(templates))
 	for _, t := range templates {
 		response = append(response, templateToResponse(t))
@@ -224,7 +279,6 @@ func handleGetTemplate(w http.ResponseWriter, r *http.Request, repo *storage.Tra
 		return
 	}
 
-	// 模板可被所有用户使用,无需归属校验(删除/修改另行限制)。
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(templateToResponse(t))
 }
@@ -241,13 +295,6 @@ func handleCreateTemplate(w http.ResponseWriter, r *http.Request, repo *storage.
 		return
 	}
 
-	username := auth.UsernameFromContext(r.Context())
-	// 配额校验:普通用户创建模板受全局配额限制(admin 不限)。
-	if err := checkUserQuota(r.Context(), repo, username, "template"); err != nil {
-		writeError(w, http.StatusForbidden, err)
-		return
-	}
-
 	t := storage.Template{
 		Name:             req.Name,
 		Category:         req.Category,
@@ -255,7 +302,6 @@ func handleCreateTemplate(w http.ResponseWriter, r *http.Request, repo *storage.
 		RuleSource:       req.RuleSource,
 		UseProxy:         req.UseProxy,
 		EnableIncludeAll: req.EnableIncludeAll,
-		CreatedBy:        username,
 	}
 
 	id, err := repo.CreateTemplate(r.Context(), t)
@@ -287,16 +333,6 @@ func handleUpdateTemplate(w http.ResponseWriter, r *http.Request, repo *storage.
 		return
 	}
 
-	// 归属校验:普通用户不能改别人的模板。
-	username := auth.UsernameFromContext(r.Context())
-	if !userIsAdmin(r.Context(), repo, username) {
-		existing, gerr := repo.GetTemplateByID(r.Context(), id)
-		if gerr != nil || existing.CreatedBy != username {
-			writeError(w, http.StatusNotFound, storage.ErrTemplateNotFound)
-			return
-		}
-	}
-
 	t := storage.Template{
 		ID:               id,
 		Name:             req.Name,
@@ -305,7 +341,6 @@ func handleUpdateTemplate(w http.ResponseWriter, r *http.Request, repo *storage.
 		RuleSource:       req.RuleSource,
 		UseProxy:         req.UseProxy,
 		EnableIncludeAll: req.EnableIncludeAll,
-		CreatedBy:        username,
 	}
 
 	if err := repo.UpdateTemplate(r.Context(), t); err != nil {
@@ -328,15 +363,6 @@ func handleUpdateTemplate(w http.ResponseWriter, r *http.Request, repo *storage.
 }
 
 func handleDeleteTemplate(w http.ResponseWriter, r *http.Request, repo *storage.TrafficRepository, id int64) {
-	// 归属校验:普通用户不能删别人的模板。
-	username := auth.UsernameFromContext(r.Context())
-	if !userIsAdmin(r.Context(), repo, username) {
-		existing, gerr := repo.GetTemplateByID(r.Context(), id)
-		if gerr != nil || existing.CreatedBy != username {
-			writeError(w, http.StatusNotFound, storage.ErrTemplateNotFound)
-			return
-		}
-	}
 	if err := repo.DeleteTemplate(r.Context(), id); err != nil {
 		if errors.Is(err, storage.ErrTemplateNotFound) {
 			writeError(w, http.StatusNotFound, err)
@@ -359,13 +385,14 @@ func templateToResponse(t storage.Template) templateResponse {
 		RuleSource:       t.RuleSource,
 		UseProxy:         t.UseProxy,
 		EnableIncludeAll: t.EnableIncludeAll,
-		CreatedBy:        t.CreatedBy,
 		CreatedAt:        t.CreatedAt.Format("2006-01-02 15:04:05"),
 		UpdatedAt:        t.UpdatedAt.Format("2006-01-02 15:04:05"),
 	}
 }
 
 func fetchRemoteContent(url string, timeout time.Duration) (string, error) {
+	// 注:此处为管理员专用(RequireAdmin)的规则源抓取,允许指向 LAN/自建源(自托管常见需求),
+	// 故不套 SSRF 客户端。SSRF 防护只加在非管理员可达 / 用户可控 URL 的抓取路径上。
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -394,7 +421,7 @@ type fetchSourceResponse struct {
 	Content string `json:"content"`
 }
 
-// 处理获取模板源文件内容
+// NewTemplateFetchSourceHandler handles fetching template source file content
 func NewTemplateFetchSourceHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

@@ -19,7 +19,7 @@ type proxyGroupsHandler struct {
 	store *proxygroups.Store
 }
 
-// 创建代理组配置处理器
+// NewProxyGroupsHandler 创建代理组配置处理器
 func NewProxyGroupsHandler(store *proxygroups.Store) http.Handler {
 	if store == nil {
 		panic("proxy groups handler requires store")

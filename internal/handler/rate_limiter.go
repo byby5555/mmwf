@@ -8,6 +8,7 @@ import (
 	"miaomiaowux/internal/logger"
 )
 
+// 使用英文错误消息, 防止老外看不懂
 var ErrRateLimited = errors.New("rate limit exceeded")
 
 var globalLoginRateLimiter *LoginRateLimiter
@@ -29,13 +30,9 @@ type LoginRateLimiter struct {
 	maxAttempts     int
 	windowDuration  time.Duration
 	lockDuration    time.Duration
-	// skipLocalIP 命中本地/私有 IP 时,跳过 IP 维度限流;账户维度仍生效。
-	// 防反代未传 XFF 时所有真实用户共享同一个内网 IP 一起被锁。
-	skipLocalIP bool
+	skipLocalIP     bool
 }
 
-// NewLoginRateLimiter 默认值构造:5 次失败 / 1 小时窗口 / 1 小时锁定。
-// 登录限流没有 enabled 开关(登录路径必须有基本防护)。
 func NewLoginRateLimiter() *LoginRateLimiter {
 	l := &LoginRateLimiter{
 		maxAttempts:    5,
@@ -47,7 +44,6 @@ func NewLoginRateLimiter() *LoginRateLimiter {
 	return l
 }
 
-// NewLoginRateLimiterWithConfig 用 system_settings 自定义阈值构造。
 func NewLoginRateLimiterWithConfig(maxAttempts, windowMinutes, lockMinutes int) *LoginRateLimiter {
 	l := &LoginRateLimiter{
 		maxAttempts:    maxAttempts,
@@ -59,21 +55,6 @@ func NewLoginRateLimiterWithConfig(maxAttempts, windowMinutes, lockMinutes int) 
 	return l
 }
 
-// SetSkipLocalIP 切换"是否跳过本地/私有 IP 的 IP 维度限流"。账户维度始终生效。
-func (l *LoginRateLimiter) SetSkipLocalIP(skip bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.skipLocalIP = skip
-}
-
-func (l *LoginRateLimiter) shouldSkipIP(ip string) bool {
-	l.mu.RLock()
-	skip := l.skipLocalIP
-	l.mu.RUnlock()
-	return skip && IsLocalOrPrivateIP(ip)
-}
-
-// UpdateConfig 热更新参数 — security_settings handler PUT 后调用。
 func (l *LoginRateLimiter) UpdateConfig(maxAttempts, windowMinutes, lockMinutes int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -86,6 +67,19 @@ func (l *LoginRateLimiter) getConfig() (int, time.Duration, time.Duration) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.maxAttempts, l.windowDuration, l.lockDuration
+}
+
+func (l *LoginRateLimiter) SetSkipLocalIP(skip bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.skipLocalIP = skip
+}
+
+func (l *LoginRateLimiter) shouldSkipIP(ip string) bool {
+	l.mu.RLock()
+	skip := l.skipLocalIP
+	l.mu.RUnlock()
+	return skip && IsLocalOrPrivateIP(ip)
 }
 
 func (l *LoginRateLimiter) Check(ip, username string) error {

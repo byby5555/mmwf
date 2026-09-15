@@ -3,8 +3,6 @@ package handler
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 	"miaomiaowux/internal/storage"
 	"miaomiaowux/internal/validator"
 
@@ -29,7 +28,38 @@ type subscribeFilesHandler struct {
 	repo *storage.TrafficRepository
 }
 
-// 返回一个仅用于管理订阅文件的处理程序。
+func sanitizeSubscribeFilename(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errors.New("文件名不能为空")
+	}
+	if filepath.Base(name) != name || strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) {
+		return "", errors.New("文件名不能包含路径或 ..")
+	}
+	for _, char := range name {
+		if char < 0x20 || char == 0x7f {
+			return "", errors.New("文件名包含控制字符")
+		}
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	if ext != ".yaml" && ext != ".yml" {
+		name += ".yaml"
+	}
+	return name, nil
+}
+
+func (h *subscribeFilesHandler) ensureFilenameAvailable(ctx context.Context, filename string) error {
+	existing, err := h.repo.GetSubscribeFileByFilename(ctx, filename)
+	if errors.Is(err, storage.ErrSubscribeFileNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("文件名 %s 已被订阅「%s」使用，请更换文件名", filename, existing.Name)
+}
+
+// NewSubscribeFilesHandler returns an admin-only handler for managing subscribe files.
 func NewSubscribeFilesHandler(repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
 		panic("subscribe files handler requires repository")
@@ -51,29 +81,29 @@ func (h *subscribeFilesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		h.handleCreate(w, r)
 	case path == "reorder" && r.Method == http.MethodPut:
 		h.handleReorder(w, r)
-	case path == "traffic" && r.Method == http.MethodGet:
-		h.handleTraffic(w, r)
 	case path == "import" && r.Method == http.MethodPost:
 		h.handleImport(w, r)
 	case path == "upload" && r.Method == http.MethodPost:
 		h.handleUpload(w, r)
 	case path == "create-from-config" && r.Method == http.MethodPost:
 		h.handleCreateFromConfig(w, r)
+	case path == "create-aggregate" && r.Method == http.MethodPost:
+		h.handleCreateAggregate(w, r)
 	case strings.HasSuffix(path, "/users") && r.Method == http.MethodGet:
-		// GET /api/admin/subscribe-files/{id}/users — 列出该订阅分配给哪些用户(同步自 mmw v0.7.3)
+		// GET /api/admin/subscribe-files/{id}/users
 		idStr := strings.TrimSuffix(path, "/users")
 		h.handleGetSubscriptionUsers(w, r, idStr)
 	case strings.HasSuffix(path, "/content") && r.Method == http.MethodGet:
-		// GET /api/admin/subscribe-files/{文件名}/内容
+		// GET /api/admin/subscribe-files/{filename}/content
 		filename := strings.TrimSuffix(path, "/content")
 		h.handleGetContent(w, r, filename)
 	case strings.HasSuffix(path, "/content") && r.Method == http.MethodPut:
-		// PUT /api/admin/subscribe-files/{文件名}/内容
+		// PUT /api/admin/subscribe-files/{filename}/content
 		filename := strings.TrimSuffix(path, "/content")
 		h.handleUpdateContent(w, r, filename)
-	case path != "" && path != "import" && path != "upload" && path != "create-from-config" && (r.Method == http.MethodPut || r.Method == http.MethodPatch):
+	case path != "" && path != "import" && path != "upload" && path != "create-from-config" && path != "create-aggregate" && (r.Method == http.MethodPut || r.Method == http.MethodPatch):
 		h.handleUpdate(w, r, path)
-	case path != "" && path != "import" && path != "upload" && path != "create-from-config" && r.Method == http.MethodDelete:
+	case path != "" && path != "import" && path != "upload" && path != "create-from-config" && path != "create-aggregate" && r.Method == http.MethodDelete:
 		h.handleDelete(w, r, path)
 	default:
 		allowed := []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete}
@@ -82,81 +112,34 @@ func (h *subscribeFilesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 }
 
 func (h *subscribeFilesHandler) handleList(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	files, err := h.repo.ListSubscribeFiles(ctx)
+	files, err := h.repo.ListSubscribeFiles(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
-	// 数据隔离:
-	//   - 普通用户:只看自己创建的
-	//   - admin:看 created_by="" / created_by=自己 / created_by 是另一个 admin。
-	//     普通用户通过"生成订阅"创建的私有订阅对 admin 不可见(避免泄露其他用户的私订阅)。
-	//   注:这里只过滤"列表"。admin 仍可通过 GET/PUT/DELETE 路径直接拿订阅 ID 操作,后台清理 / 帮用户排错时需要。
-	username := auth.UsernameFromContext(ctx)
-	isAdmin := userIsAdmin(ctx, h.repo, username)
-	if !isAdmin {
-		filtered := make([]storage.SubscribeFile, 0, len(files))
-		for _, f := range files {
-			if f.CreatedBy == username {
-				filtered = append(filtered, f)
-			}
-		}
-		files = filtered
-	} else {
-		files = filterAdminVisibleSubscribeFiles(ctx, h.repo, files, username)
-	}
-
 	respondJSON(w, http.StatusOK, map[string]any{
-		"files": h.convertSubscribeFilesWithVersions(ctx, files),
+		"files": h.convertSubscribeFilesWithVersions(r.Context(), files),
 	})
 }
 
-var errSubscribeFilenameTaken = errors.New("文件名已被其他用户占用")
-
-// sanitizeSubscribeFilename 校验订阅文件名安全并补全扩展名。
-// 防路径穿越:必须是纯基名(不含路径分隔符 / 反斜杠 / .. / 控制字符),否则拒绝;
-// 统一补 .yaml/.yml 扩展。所有把 filename 拼进 subscribes/<filename> 的入口都必须先过它。
-func sanitizeSubscribeFilename(name string) (string, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return "", errors.New("文件名不能为空")
+func (h *subscribeFilesHandler) handleReorder(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs []int64 `json:"ids"`
 	}
-	if strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") || name != filepath.Base(name) {
-		return "", errors.New("文件名非法:不能包含路径分隔符或 ..")
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeBadRequest(w, "请求格式不正确")
+		return
 	}
-	for _, c := range name {
-		if c < 0x20 || c == 0x7f {
-			return "", errors.New("文件名含非法控制字符")
-		}
+	if len(req.IDs) == 0 {
+		writeBadRequest(w, "排序列表不能为空")
+		return
 	}
-	ext := filepath.Ext(name)
-	if ext != ".yaml" && ext != ".yml" {
-		name += ".yaml"
+	if err := h.repo.ReorderSubscribeFiles(r.Context(), req.IDs); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
-	return name, nil
-}
-
-// ensureFilenameWritable 防跨用户覆盖:目标 filename 若已被【他人】的订阅占用则拒绝。
-// 无人占用 / 属于自己 / 调用者是 admin → 放行。写盘(WriteFile subscribes/<filename>)前必须调用。
-func (h *subscribeFilesHandler) ensureFilenameWritable(ctx context.Context, filename, username string) error {
-	existing, err := h.repo.GetSubscribeFileByFilename(ctx, filename)
-	if err != nil {
-		if errors.Is(err, storage.ErrSubscribeFileNotFound) {
-			return nil // 无人占用
-		}
-		return err
-	}
-	if existing.CreatedBy == username || userIsAdmin(ctx, h.repo, username) {
-		return nil
-	}
-	return errSubscribeFilenameTaken
-}
-
-func subscribeFileExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (h *subscribeFilesHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -182,60 +165,34 @@ func (h *subscribeFilesHandler) handleCreate(w http.ResponseWriter, r *http.Requ
 		writeBadRequest(w, "文件名是必填项")
 		return
 	}
-
-	username := auth.UsernameFromContext(r.Context())
-
-	// 安全:校验文件名(防路径穿越)+ 统一扩展名。
-	sanitizedName, serr := sanitizeSubscribeFilename(req.Filename)
-	if serr != nil {
-		writeBadRequest(w, serr.Error())
+	filename, err := sanitizeSubscribeFilename(req.Filename)
+	if err != nil {
+		writeBadRequest(w, err.Error())
 		return
 	}
-	req.Filename = sanitizedName
-
-	// 跨用户占用防护:filename 已被他人订阅占用则拒绝(防后续 update-content 覆盖他人物理文件)。
-	if err := h.ensureFilenameWritable(r.Context(), req.Filename, username); err != nil {
+	if err := h.ensureFilenameAvailable(r.Context(), filename); err != nil {
 		writeError(w, http.StatusConflict, err)
 		return
 	}
-
-	// 配额校验:普通用户创建订阅受全局配额限制(admin 不限)。
-	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
-		writeError(w, http.StatusForbidden, err)
-		return
-	}
+	req.Filename = filename
 
 	file := storage.SubscribeFile{
-		Name:             req.Name,
-		Description:      req.Description,
-		URL:              req.URL,
-		Type:             req.Type,
-		Filename:         req.Filename,
-		TemplateFilename: req.TemplateFilename,
-		SelectedTags:     req.SelectedTags,
-		SelectedNodeIDs:  req.SelectedNodeIDs,
-		SelectedCustomRuleIDs:     req.SelectedCustomRuleIDs,
-		SelectedOverrideScriptIDs: req.SelectedOverrideScriptIDs,
-		StatsServerIDs:   req.StatsServerIDs,
-		TrafficLimit:     req.TrafficLimit,
-		CreatedBy:        username,
+		Name:        req.Name,
+		Description: req.Description,
+		URL:         req.URL,
+		Type:        req.Type,
+		Filename:    req.Filename,
 	}
-	if req.RawOutput != nil {
-		file.RawOutput = *req.RawOutput
+
+	expireAt, err := parseExpireAt(req.ExpireAt)
+	if err != nil {
+		writeBadRequest(w, "过期时间格式不正确，需为 RFC3339")
+		return
 	}
-	if req.SortOrder != nil {
-		file.SortOrder = *req.SortOrder
-	}
-	if req.CustomShortCode != nil {
-		file.CustomShortCode = *req.CustomShortCode
-	}
+	file.ExpireAt = expireAt
 
 	created, err := h.repo.CreateSubscribeFile(r.Context(), file)
 	if err != nil {
-		if errors.Is(err, storage.ErrCustomShortCodeExists) {
-			writeError(w, http.StatusConflict, err)
-			return
-		}
 		if errors.Is(err, storage.ErrSubscribeFileExists) {
 			writeError(w, http.StatusConflict, errors.New("订阅名称已存在"))
 			return
@@ -244,8 +201,8 @@ func (h *subscribeFilesHandler) handleCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// 不要为基于 URL 的订阅自动应用自定义规则
-	// 它们将在首次获取订阅时应用
+	// Don't auto-apply custom rules for URL-based subscriptions
+	// They will be applied when the subscription is first fetched
 
 	respondJSON(w, http.StatusCreated, map[string]any{
 		"file": convertSubscribeFile(created),
@@ -273,11 +230,13 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 		writeBadRequest(w, "订阅名称是必填项")
 		return
 	}
+	if err := validateFetchURL(req.URL); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 
 	// 创建HTTP客户端并获取订阅内容
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	client := newSSRFSafeHTTPClient(30 * time.Second)
 
 	httpReq, err := http.NewRequest("GET", req.URL, nil)
 	if err != nil {
@@ -301,9 +260,13 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 	}
 
 	// 读取响应内容
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchBodyBytes+1))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("读取订阅内容失败"))
+		return
+	}
+	if len(body) > maxFetchBodyBytes {
+		writeError(w, http.StatusBadRequest, errors.New("订阅内容超过 10MB 限制"))
 		return
 	}
 
@@ -326,25 +289,13 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// 安全:校验文件名(防路径穿越)+ 统一扩展名
-	sanitizedName, serr := sanitizeSubscribeFilename(filename)
-	if serr != nil {
-		writeBadRequest(w, serr.Error())
+	filename, err = sanitizeSubscribeFilename(filename)
+	if err != nil {
+		writeBadRequest(w, err.Error())
 		return
 	}
-	filename = sanitizedName
-
-	username := auth.UsernameFromContext(r.Context())
-
-	// 跨用户覆盖防护:filename 已被他人订阅占用则拒绝(写盘前)。
-	if err := h.ensureFilenameWritable(r.Context(), filename, username); err != nil {
+	if err := h.ensureFilenameAvailable(r.Context(), filename); err != nil {
 		writeError(w, http.StatusConflict, err)
-		return
-	}
-
-	// 配额校验:普通用户创建订阅受全局配额限制(admin 不限)。(写盘前校验,失败无需回滚文件)
-	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
-		writeError(w, http.StatusForbidden, err)
 		return
 	}
 
@@ -356,7 +307,6 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 	}
 
 	filePath := filepath.Join(subscribesDir, filename)
-	fileExisted := subscribeFileExists(filePath)
 	if err := os.WriteFile(filePath, body, 0644); err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
 		return
@@ -369,19 +319,12 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 		URL:         req.URL,
 		Type:        storage.SubscribeTypeImport,
 		Filename:    filename,
-		CreatedBy:   username,
 	}
 
 	created, err := h.repo.CreateSubscribeFile(r.Context(), file)
 	if err != nil {
-		// 数据库保存失败:仅删除本次新建的文件,不动已存在文件(避免误删)
-		if !fileExisted {
-			_ = os.Remove(filePath)
-		}
-		if errors.Is(err, storage.ErrCustomShortCodeExists) {
-			writeError(w, http.StatusConflict, err)
-			return
-		}
+		// 如果数据库保存失败，删除已保存的文件
+		_ = os.Remove(filePath)
 		if errors.Is(err, storage.ErrSubscribeFileExists) {
 			writeError(w, http.StatusConflict, errors.New("订阅名称已存在"))
 			return
@@ -390,8 +333,8 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// 不要对导入的文件自动应用自定义规则
-	// 如果需要，用户可以手动启用自动同步
+	// Don't auto-apply custom rules for imported files
+	// Users can manually enable auto-sync if needed
 
 	respondJSON(w, http.StatusCreated, map[string]any{
 		"file": convertSubscribeFile(created),
@@ -400,7 +343,7 @@ func (h *subscribeFilesHandler) handleImport(w http.ResponseWriter, r *http.Requ
 
 func (h *subscribeFilesHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 解析multipart form
-	if err := r.ParseMultipartForm(10 << 20); err != nil { // 详见上下文
+	if err := r.ParseMultipartForm(10 << 20); err != nil { // 10MB
 		writeBadRequest(w, "解析表单失败")
 		return
 	}
@@ -412,6 +355,73 @@ func (h *subscribeFilesHandler) handleUpload(w http.ResponseWriter, r *http.Requ
 	}
 	defer file.Close()
 
+	// 解析覆盖和原始输出参数
+	overwriteIDStr := r.FormValue("overwrite_id")
+	rawOutputStr := r.FormValue("raw_output")
+	rawOutput := rawOutputStr == "true" || rawOutputStr == "1"
+
+	// 读取文件内容
+	content, err := io.ReadAll(file)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, errors.New("读取文件失败"))
+		return
+	}
+
+	// 非原始输出模式需要验证YAML格式
+	if !rawOutput {
+		var yamlCheck map[string]any
+		if err := yaml.Unmarshal(content, &yamlCheck); err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("文件不是有效的YAML格式"))
+			return
+		}
+	}
+
+	subscribesDir := "subscribes"
+	if err := os.MkdirAll(subscribesDir, 0755); err != nil {
+		writeError(w, http.StatusInternalServerError, errors.New("创建订阅目录失败"))
+		return
+	}
+
+	// 覆盖模式：替换已有订阅的文件内容
+	if overwriteIDStr != "" && overwriteIDStr != "0" {
+		overwriteID, parseErr := strconv.ParseInt(overwriteIDStr, 10, 64)
+		if parseErr != nil || overwriteID <= 0 {
+			writeBadRequest(w, "无效的覆盖订阅ID")
+			return
+		}
+
+		existing, getErr := h.repo.GetSubscribeFileByID(r.Context(), overwriteID)
+		if getErr != nil {
+			if errors.Is(getErr, storage.ErrSubscribeFileNotFound) {
+				writeError(w, http.StatusNotFound, errors.New("要覆盖的订阅不存在"))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, getErr)
+			return
+		}
+
+		// 覆写物理文件
+		filePath := filepath.Join(subscribesDir, existing.Filename)
+		if err := os.WriteFile(filePath, content, 0644); err != nil {
+			writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
+			return
+		}
+
+		// 如果 raw_output 状态变化，更新数据库
+		if existing.RawOutput != rawOutput {
+			existing.RawOutput = rawOutput
+			if _, updateErr := h.repo.UpdateSubscribeFile(r.Context(), existing); updateErr != nil {
+				logger.Info("[上传覆盖] 更新 raw_output 失败", "id", overwriteID, "error", updateErr)
+			}
+		}
+
+		respondJSON(w, http.StatusOK, map[string]any{
+			"file": convertSubscribeFile(existing),
+		})
+		return
+	}
+
+	// 新建模式
 	name := r.FormValue("name")
 	if name == "" {
 		name = strings.TrimSuffix(header.Filename, filepath.Ext(header.Filename))
@@ -423,75 +433,40 @@ func (h *subscribeFilesHandler) handleUpload(w http.ResponseWriter, r *http.Requ
 		filename = header.Filename
 	}
 
-	// 安全:校验文件名(防路径穿越)+ 统一扩展名
-	sanitizedName, serr := sanitizeSubscribeFilename(filename)
-	if serr != nil {
-		writeBadRequest(w, serr.Error())
+	// 非原始输出模式确保文件名有.yaml或.yml扩展名
+	if !rawOutput {
+		filename, err = sanitizeSubscribeFilename(filename)
+		if err != nil {
+			writeBadRequest(w, err.Error())
+			return
+		}
+	} else if filepath.Base(filename) != filename || strings.Contains(filename, "..") || strings.ContainsAny(filename, `/\`) {
+		writeBadRequest(w, "文件名不能包含路径或 ..")
 		return
 	}
-	filename = sanitizedName
-
-	// 读取并验证YAML格式
-	content, err := io.ReadAll(file)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, errors.New("读取文件失败"))
-		return
-	}
-
-	var yamlCheck map[string]any
-	if err := yaml.Unmarshal(content, &yamlCheck); err != nil {
-		writeError(w, http.StatusBadRequest, errors.New("文件不是有效的YAML格式"))
-		return
-	}
-
-	username := auth.UsernameFromContext(r.Context())
-
-	// 跨用户覆盖防护:filename 已被他人订阅占用则拒绝(写盘前)。
-	if err := h.ensureFilenameWritable(r.Context(), filename, username); err != nil {
+	if err := h.ensureFilenameAvailable(r.Context(), filename); err != nil {
 		writeError(w, http.StatusConflict, err)
 		return
 	}
 
-	// 配额校验:普通用户创建订阅受全局配额限制(admin 不限)。(写盘前校验,失败无需回滚文件)
-	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
-		writeError(w, http.StatusForbidden, err)
-		return
-	}
-
-	// 保存文件到subscribes目录
-	subscribesDir := "subscribes"
-	if err := os.MkdirAll(subscribesDir, 0755); err != nil {
-		writeError(w, http.StatusInternalServerError, errors.New("创建订阅目录失败"))
-		return
-	}
-
 	filePath := filepath.Join(subscribesDir, filename)
-	fileExisted := subscribeFileExists(filePath)
 	if err := os.WriteFile(filePath, content, 0644); err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
 		return
 	}
 
-	// 保存到数据库
 	subscribeFile := storage.SubscribeFile{
 		Name:        name,
 		Description: description,
-		URL:         "", // 上传的文件没有URL
+		URL:         "",
 		Type:        storage.SubscribeTypeUpload,
 		Filename:    filename,
-		CreatedBy:   username,
+		RawOutput:   rawOutput,
 	}
 
 	created, err := h.repo.CreateSubscribeFile(r.Context(), subscribeFile)
 	if err != nil {
-		// 数据库保存失败:仅删除本次新建的文件,不动已存在文件(避免误删)
-		if !fileExisted {
-			_ = os.Remove(filePath)
-		}
-		if errors.Is(err, storage.ErrCustomShortCodeExists) {
-			writeError(w, http.StatusConflict, err)
-			return
-		}
+		_ = os.Remove(filePath)
 		if errors.Is(err, storage.ErrSubscribeFileExists) {
 			writeError(w, http.StatusConflict, errors.New("订阅名称已存在"))
 			return
@@ -499,9 +474,6 @@ func (h *subscribeFilesHandler) handleUpload(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-
-	// 不要对上传的文件自动应用自定义规则
-	// 如果需要，用户可以手动启用自动同步
 
 	respondJSON(w, http.StatusCreated, map[string]any{
 		"file": convertSubscribeFile(created),
@@ -525,25 +497,9 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// 所有权校验:普通用户只能改自己创建的订阅。
-	uname := auth.UsernameFromContext(r.Context())
-	isAdmin := userIsAdmin(r.Context(), h.repo, uname)
-	if !isAdmin && existing.CreatedBy != uname {
-		writeError(w, http.StatusNotFound, storage.ErrSubscribeFileNotFound)
-		return
-	}
-
 	var req subscribeFileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeBadRequest(w, "请求格式不正确")
-		return
-	}
-
-	// 短码编辑只允许管理员:普通用户即使是订阅创建者,也不能改 custom_short_code(短码归全局命名空间,必须管理)。
-	// CustomShortCode 是 *string:nil = 前端没传(内联更新模板/标签等场景),不要碰短码;
-	// 非 nil + 值变化 = 用户主动改 → 需要管理员权限。
-	if !isAdmin && req.CustomShortCode != nil && *req.CustomShortCode != existing.CustomShortCode {
-		writeError(w, http.StatusForbidden, errors.New("只有管理员可以编辑短码"))
 		return
 	}
 
@@ -560,17 +516,8 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 	if req.Type != "" {
 		existing.Type = req.Type
 	}
-	// 更新 auto_sync_custom_rules（如果提供）
-	wasAutoSyncEnabled := existing.AutoSyncCustomRules
 	if req.AutoSyncCustomRules != nil {
 		existing.AutoSyncCustomRules = *req.AutoSyncCustomRules
-	}
-	existing.TemplateFilename = req.TemplateFilename
-	if req.SelectedTags != nil {
-		existing.SelectedTags = req.SelectedTags
-	}
-	if req.SelectedNodeIDs != nil {
-		existing.SelectedNodeIDs = req.SelectedNodeIDs
 	}
 	if req.SelectedCustomRuleIDs != nil {
 		existing.SelectedCustomRuleIDs = req.SelectedCustomRuleIDs
@@ -578,30 +525,82 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 	if req.SelectedOverrideScriptIDs != nil {
 		existing.SelectedOverrideScriptIDs = req.SelectedOverrideScriptIDs
 	}
-	existing.StatsServerIDs = req.StatsServerIDs
-	existing.TrafficLimit = req.TrafficLimit
-	// 仅当前端显式传了 custom_short_code 才覆盖(同上,nil = 内联更新场景,保留原值)
-	if req.CustomShortCode != nil {
-		existing.CustomShortCode = *req.CustomShortCode
-	}
 	if req.RawOutput != nil {
 		existing.RawOutput = *req.RawOutput
 	}
-	if req.SortOrder != nil {
-		existing.SortOrder = *req.SortOrder
+	if req.TrafficLimit != nil {
+		existing.TrafficLimit = req.TrafficLimit
+	}
+	if req.StatsServerIDs != nil {
+		existing.StatsServerIDs = *req.StatsServerIDs
+	}
+	templateJustBound := false
+	tagsChanged := false
+	if req.TemplateFilename != nil {
+		existing.TemplateFilename = *req.TemplateFilename
+		if *req.TemplateFilename != "" {
+			templateJustBound = true
+		}
+	}
+	// 更新选中的节点标签(legacy)
+	if req.SelectedTags != nil {
+		existing.SelectedTags = req.SelectedTags
+		tagsChanged = true
+	}
+	// 更新选中的节点 ID(新模式,精确)。非空时优先于 SelectedTags
+	if req.SelectedNodeIDs != nil {
+		existing.SelectedNodeIDs = req.SelectedNodeIDs
+		tagsChanged = true
+	}
+	// 更新自定义短链接码
+	if req.CustomShortCode != nil {
+		code := strings.TrimSpace(*req.CustomShortCode)
+		if code != "" {
+			for _, c := range code {
+				if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+					writeBadRequest(w, "自定义连接只能包含字母和数字")
+					return
+				}
+			}
+			// 同表唯一性：不能与其他订阅的 file_short_code 或 custom_short_code 冲突
+			fileCodes, err := h.repo.GetAllFileShortCodes(r.Context())
+			if err == nil {
+				if fn, exists := fileCodes[code]; exists && fn != existing.Filename {
+					writeBadRequest(w, "该自定义连接已被其他订阅使用")
+					return
+				}
+			}
+		}
+		existing.CustomShortCode = code
+		if m := GetSilentModeManager(); m != nil {
+			m.InvalidateShortLinkCache()
+		}
+	}
+	if req.ExpireAt != nil {
+		if *req.ExpireAt == "" {
+			existing.ExpireAt = nil
+		} else {
+			expireAt, parseErr := parseExpireAt(req.ExpireAt)
+			if parseErr != nil {
+				writeBadRequest(w, "过期时间格式不正确，需为 RFC3339")
+				return
+			}
+			existing.ExpireAt = expireAt
+		}
 	}
 
 	// 处理文件名更新
 	oldFilename := existing.Filename
 	needRenameFile := false
 	if req.Filename != "" && req.Filename != existing.Filename {
-		// 安全:校验新文件名(防路径穿越)+ 统一扩展名
-		sanitizedName, serr := sanitizeSubscribeFilename(req.Filename)
+		// [安全] 必须走 sanitizeSubscribeFilename(和创建/上传一致):此前这里只校验扩展名,
+		// 漏了 ../、/ 校验,可把文件 os.Rename 到 subscribes/ 之外(路径穿越写)。
+		safeName, serr := sanitizeSubscribeFilename(req.Filename)
 		if serr != nil {
 			writeError(w, http.StatusBadRequest, serr)
 			return
 		}
-		req.Filename = sanitizedName
+		req.Filename = safeName
 
 		// 检查新文件名是否已被其他订阅使用
 		if existingFile, err := h.repo.GetSubscribeFileByFilename(r.Context(), req.Filename); err == nil && existingFile.ID != id {
@@ -615,10 +614,6 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 
 	updated, err := h.repo.UpdateSubscribeFile(r.Context(), existing)
 	if err != nil {
-		if errors.Is(err, storage.ErrCustomShortCodeExists) {
-			writeError(w, http.StatusConflict, err)
-			return
-		}
 		if errors.Is(err, storage.ErrSubscribeFileExists) {
 			writeError(w, http.StatusConflict, errors.New("订阅名称已存在"))
 			return
@@ -650,17 +645,19 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 		// 如果旧文件不存在，只更新数据库记录，不报错
 	}
 
-	// 如果 auto_sync 刚刚启用（从 false 更改为 true），则触发立即同步
-	if !wasAutoSyncEnabled && updated.AutoSyncCustomRules {
+	// 如果绑定了V3模板或标签变化，从模板重新生成订阅文件
+	if (templateJustBound || tagsChanged) && updated.TemplateFilename != "" {
 		go func() {
-			addedGroups, err := syncCustomRulesToFile(context.Background(), h.repo, updated)
-			if err != nil {
-				logger.Info("[AutoSync] 同步自定义规则失败", "filename", updated.Filename, "id", updated.ID, "error", err)
+			ctx := context.Background()
+			username := auth.UsernameFromContext(r.Context())
+			if username == "" {
+				logger.Info("[模板生成] 无法获取用户名，跳过模板生成", "subscribe_id", updated.ID)
+				return
+			}
+			if err := h.regenerateFromTemplate(ctx, username, updated); err != nil {
+				logger.Info("[模板生成] 生成失败", "subscribe_id", updated.ID, "template", updated.TemplateFilename, "error", err)
 			} else {
-				logger.Info("[AutoSync] 同步自定义规则成功", "filename", updated.Filename, "id", updated.ID)
-				if len(addedGroups) > 0 {
-					logger.Info("[AutoSync] 添加的代理组", "groups", addedGroups)
-				}
+				logger.Info("[模板生成] 生成成功", "subscribe_id", updated.ID, "template", updated.TemplateFilename)
 			}
 		}()
 	}
@@ -688,12 +685,6 @@ func (h *subscribeFilesHandler) handleDelete(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// 所有权校验:普通用户只能删自己创建的订阅。
-	if uname := auth.UsernameFromContext(r.Context()); !userIsAdmin(r.Context(), h.repo, uname) && file.CreatedBy != uname {
-		writeError(w, http.StatusNotFound, storage.ErrSubscribeFileNotFound)
-		return
-	}
-
 	// 删除数据库记录
 	if err := h.repo.DeleteSubscribeFile(r.Context(), id); err != nil {
 		if errors.Is(err, storage.ErrSubscribeFileNotFound) {
@@ -709,181 +700,6 @@ func (h *subscribeFilesHandler) handleDelete(w http.ResponseWriter, r *http.Requ
 	_ = os.Remove(filePath) // 忽略错误，即使文件不存在也继续
 
 	respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
-}
-
-func (h *subscribeFilesHandler) handleReorder(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		IDs []int64 `json:"ids"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeBadRequest(w, "请求格式不正确")
-		return
-	}
-	if len(req.IDs) == 0 {
-		writeBadRequest(w, "排序列表不能为空")
-		return
-	}
-
-	if err := h.repo.ReorderSubscribeFiles(r.Context(), req.IDs); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	respondJSON(w, http.StatusOK, map[string]string{"status": "reordered"})
-}
-
-func (h *subscribeFilesHandler) handleTraffic(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	files, err := h.repo.ListSubscribeFiles(ctx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	// 普通用户(开了"订阅管理"权限后能进来):流量列必须显示套餐口径,
-	// 跟 /api/traffic/summary 上的"流量信息"页保持一致 —— 否则下面那条
-	// GetAllRemoteServersTrafficTotals 路径会把全平台所有用户的 inbound 流量
-	// 全聚合返回,与该用户毫无关系。
-	username := auth.UsernameFromContext(ctx)
-	if !userIsAdmin(ctx, h.repo, username) {
-		h.handleTrafficForUser(ctx, w, username, files)
-		return
-	}
-
-	allNodes, err := h.repo.ListAllNodes(ctx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	allExternalSubs, _ := h.repo.ListAllExternalSubscriptions(ctx)
-	extSubByName := make(map[string]storage.ExternalSubscription, len(allExternalSubs))
-	for _, s := range allExternalSubs {
-		extSubByName[s.Name] = s
-	}
-
-	type trafficItem struct {
-		Used  int64 `json:"used"`
-		Limit int64 `json:"limit"`
-	}
-	result := make(map[int64]trafficItem, len(files))
-
-	now := time.Now()
-	for _, f := range files {
-		nodes := allNodes
-		if len(f.SelectedTags) > 0 {
-			tagsMap := make(map[string]bool, len(f.SelectedTags))
-			for _, t := range f.SelectedTags {
-				tagsMap[t] = true
-			}
-			filtered := make([]storage.Node, 0)
-			for _, n := range allNodes {
-				if n.HasAnyTag(tagsMap) {
-					filtered = append(filtered, n)
-				}
-			}
-			nodes = filtered
-		}
-
-		// 收集外部订阅名(用于把订阅源自带的 used/total 也算进去 — 与服务器流量并列)
-		extSubNames := make(map[string]bool)
-		for _, n := range nodes {
-			if n.Tag != "" && n.Tag != "手动输入" {
-				extSubNames[n.Tag] = true
-			}
-		}
-
-		// 服务器流量范围:
-		//   stats_server_ids 非空 → 仅统计选中的服务器
-		//   stats_server_ids 空(默认)→ 统计全部服务器
-		var serverScopeIDs []int64
-		if strings.TrimSpace(f.StatsServerIDs) != "" {
-			for _, s := range strings.Split(f.StatsServerIDs, ",") {
-				if id, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil && id > 0 {
-					serverScopeIDs = append(serverScopeIDs, id)
-				}
-			}
-		}
-
-		var totalUsed, totalLimit int64
-		if len(serverScopeIDs) > 0 {
-			limit, used, _ := h.repo.GetRemoteServerTrafficTotals(ctx, serverScopeIDs)
-			totalUsed += used
-			totalLimit += limit
-		} else {
-			limit, used, _ := h.repo.GetAllRemoteServersTrafficTotals(ctx)
-			totalUsed += used
-			totalLimit += limit
-		}
-
-		for name := range extSubNames {
-			sub, ok := extSubByName[name]
-			if !ok {
-				continue
-			}
-			if sub.Expire != nil && sub.Expire.Before(now) {
-				continue
-			}
-			totalLimit += sub.Total
-			switch sub.TrafficMode {
-			case "download":
-				totalUsed += sub.Download
-			case "upload":
-				totalUsed += sub.Upload
-			default:
-				totalUsed += sub.Upload + sub.Download
-			}
-		}
-
-		// 仅当订阅自带 traffic_limit > 0 时才作为"用户显式覆盖"使用;
-		// nil / 0 都视作"跟随服务器算出的 totalLimit",避免前端 inline payload 把 0 持久化后覆盖掉服务器额度。
-		if f.TrafficLimit != nil && *f.TrafficLimit > 0 {
-			totalLimit = int64(*f.TrafficLimit * 1024 * 1024 * 1024)
-		}
-		result[f.ID] = trafficItem{Used: totalUsed, Limit: totalLimit}
-	}
-
-	respondJSON(w, http.StatusOK, map[string]any{"traffic": result})
-}
-
-// handleTrafficForUser 给单个普通用户返回订阅流量:对该用户名下每个订阅文件
-// 都填同一组 {used, limit} = 用户套餐口径,跟 /api/traffic/summary 完全一致。
-// 没绑套餐的用户:返回 0/0(前端会显示无限制/未消耗,行为与流量信息页一致)。
-func (h *subscribeFilesHandler) handleTrafficForUser(ctx context.Context, w http.ResponseWriter, username string, files []storage.SubscribeFile) {
-	type trafficItem struct {
-		Used  int64 `json:"used"`
-		Limit int64 `json:"limit"`
-	}
-	result := make(map[int64]trafficItem, len(files))
-
-	var used, limit int64
-	if username != "" {
-		if user, err := h.repo.GetUser(ctx, username); err == nil && user.PackageID > 0 {
-			if pkg, perr := h.repo.GetPackage(ctx, user.PackageID); perr == nil {
-				// 有效上限 = 用户级覆写 ?? 套餐流量,与 enforcer 断流口径一致。
-				limit = resolveTrafficLimitBytes(&user, pkg)
-				// 计费流量:倍率已在采集时折算,拿到即最终值。
-				if billable, terr := h.repo.GetUserBillableTraffic(ctx, username); terr == nil {
-					used = billable
-				}
-			}
-		}
-	}
-
-	for _, f := range files {
-		if f.CreatedBy != username {
-			continue
-		}
-		// 订阅自定义限额覆盖套餐限额(管理员路径的同款语义)
-		fileLimit := limit
-		if f.TrafficLimit != nil {
-			fileLimit = int64(*f.TrafficLimit * 1024 * 1024 * 1024)
-		}
-		result[f.ID] = trafficItem{Used: used, Limit: fileLimit}
-	}
-
-	respondJSON(w, http.StatusOK, map[string]any{"traffic": result})
 }
 
 // parseFilenameFromContentDisposition 从Content-Disposition头解析文件名
@@ -917,60 +733,54 @@ func parseFilenameFromContentDisposition(header string) string {
 }
 
 type subscribeFileRequest struct {
-	Name                string   `json:"name"`
-	Description         string   `json:"description"`
-	URL                 string   `json:"url"`
-	Type                string   `json:"type"`
-	Filename            string   `json:"filename"`
-	AutoSyncCustomRules *bool    `json:"auto_sync_custom_rules,omitempty"`
-	TemplateFilename    string   `json:"template_filename"`
-	SelectedTags        []string `json:"selected_tags"`
-	SelectedNodeIDs     []int64  `json:"selected_node_ids"`
-	SelectedCustomRuleIDs     []int64 `json:"selected_custom_rule_ids"`
-	SelectedOverrideScriptIDs []int64 `json:"selected_override_script_ids"`
-	StatsServerIDs      string   `json:"stats_server_ids"`
-	TrafficLimit        *float64 `json:"traffic_limit"`
-	// 必须用指针以区分"前端没传"vs"前端想清空":
-	// 内联更新(只发 template_filename)时 CustomShortCode 字段缺省,
-	// 旧 string 零值会被误判为"想把短码清空"→ 触发"只有管理员可以编辑短码"。
-	CustomShortCode     *string  `json:"custom_short_code,omitempty"`
-	RawOutput           *bool    `json:"raw_output,omitempty"`
-	SortOrder           *int     `json:"sort_order,omitempty"`
+	Name                      string   `json:"name"`
+	Description               string   `json:"description"`
+	URL                       string   `json:"url"`
+	Type                      string   `json:"type"`
+	Filename                  string   `json:"filename"`
+	AutoSyncCustomRules       *bool    `json:"auto_sync_custom_rules,omitempty"`
+	SelectedCustomRuleIDs     []int64  `json:"selected_custom_rule_ids,omitempty"`
+	SelectedOverrideScriptIDs []int64  `json:"selected_override_script_ids,omitempty"`
+	TemplateFilename          *string  `json:"template_filename,omitempty"`
+	SelectedTags              []string `json:"selected_tags,omitempty"`
+	SelectedNodeIDs           []int64  `json:"selected_node_ids,omitempty"`
+	CustomShortCode           *string  `json:"custom_short_code,omitempty"` // 自定义短链接码
+	ExpireAt                  *string  `json:"expire_at,omitempty"`
+	RawOutput                 *bool    `json:"raw_output,omitempty"` // 非Clash配置，直接输出原始内容
+	TrafficLimit              *float64 `json:"traffic_limit,omitempty"`
+	StatsServerIDs            *string  `json:"stats_server_ids,omitempty"`
 }
 
 type subscribeFileDTO struct {
-	ID                  int64      `json:"id"`
-	Name                string     `json:"name"`
-	Description         string     `json:"description"`
-	Type                string     `json:"type"`
-	Filename            string     `json:"filename"`
-	FileShortCode       string     `json:"file_short_code"`
-	CustomShortCode     string     `json:"custom_short_code"`
-	AutoSyncCustomRules bool       `json:"auto_sync_custom_rules"`
-	TemplateFilename    string     `json:"template_filename"`
-	SelectedTags        []string   `json:"selected_tags"`
-	SelectedNodeIDs     []int64    `json:"selected_node_ids"`
-	SelectedCustomRuleIDs     []int64 `json:"selected_custom_rule_ids"`
-	SelectedOverrideScriptIDs []int64 `json:"selected_override_script_ids"`
-	StatsServerIDs      string     `json:"stats_server_ids"`
-	TrafficLimit        *float64   `json:"traffic_limit"`
-	SortOrder           int        `json:"sort_order"`
-	RawOutput           bool       `json:"raw_output"`
-	CreatedBy           string     `json:"created_by"`
-	CreatedAt           time.Time  `json:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at"`
-	LatestVersion       int64      `json:"latest_version,omitempty"`
+	ID                        int64      `json:"id"`
+	Name                      string     `json:"name"`
+	Description               string     `json:"description"`
+	Type                      string     `json:"type"`
+	Filename                  string     `json:"filename"`
+	ExpireAt                  *time.Time `json:"expire_at,omitempty"`
+	AutoSyncCustomRules       bool       `json:"auto_sync_custom_rules"`
+	SelectedCustomRuleIDs     []int64    `json:"selected_custom_rule_ids"`
+	SelectedOverrideScriptIDs []int64    `json:"selected_override_script_ids"`
+	TemplateFilename          string     `json:"template_filename"`
+	SelectedTags              []string   `json:"selected_tags"`
+	SelectedNodeIDs           []int64    `json:"selected_node_ids"`
+	CustomShortCode           string     `json:"custom_short_code"`
+	RawOutput                 bool       `json:"raw_output"`
+	TrafficLimit              *float64   `json:"traffic_limit"`
+	StatsServerIDs            string     `json:"stats_server_ids"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
+	LatestVersion             int64      `json:"latest_version,omitempty"`
 }
 
 func convertSubscribeFile(file storage.SubscribeFile) subscribeFileDTO {
-	// nil → 空数组,避免 JSON 序列化成 null 让前端 .map / .has 走错分支
-	tags := file.SelectedTags
-	if tags == nil {
-		tags = []string{}
+	selectedTags := file.SelectedTags
+	if selectedTags == nil {
+		selectedTags = []string{}
 	}
-	nodeIDs := file.SelectedNodeIDs
-	if nodeIDs == nil {
-		nodeIDs = []int64{}
+	selectedNodeIDs := file.SelectedNodeIDs
+	if selectedNodeIDs == nil {
+		selectedNodeIDs = []int64{}
 	}
 	ruleIDs := file.SelectedCustomRuleIDs
 	if ruleIDs == nil {
@@ -981,26 +791,24 @@ func convertSubscribeFile(file storage.SubscribeFile) subscribeFileDTO {
 		scriptIDs = []int64{}
 	}
 	return subscribeFileDTO{
-		ID:                  file.ID,
-		Name:                file.Name,
-		Description:         file.Description,
-		Type:                file.Type,
-		Filename:            file.Filename,
-		FileShortCode:       file.FileShortCode,
-		CustomShortCode:     file.CustomShortCode,
-		AutoSyncCustomRules: file.AutoSyncCustomRules,
-		TemplateFilename:    file.TemplateFilename,
-		SelectedTags:        tags,
-		SelectedNodeIDs:     nodeIDs,
+		ID:                        file.ID,
+		Name:                      file.Name,
+		Description:               file.Description,
+		Type:                      file.Type,
+		Filename:                  file.Filename,
+		ExpireAt:                  file.ExpireAt,
+		AutoSyncCustomRules:       file.AutoSyncCustomRules,
 		SelectedCustomRuleIDs:     ruleIDs,
 		SelectedOverrideScriptIDs: scriptIDs,
-		StatsServerIDs:      file.StatsServerIDs,
-		TrafficLimit:        file.TrafficLimit,
-		SortOrder:           file.SortOrder,
-		RawOutput:           file.RawOutput,
-		CreatedBy:           file.CreatedBy,
-		CreatedAt:           file.CreatedAt,
-		UpdatedAt:           file.UpdatedAt,
+		TemplateFilename:          file.TemplateFilename,
+		SelectedTags:              selectedTags,
+		SelectedNodeIDs:           selectedNodeIDs,
+		CustomShortCode:           file.CustomShortCode,
+		RawOutput:                 file.RawOutput,
+		TrafficLimit:              file.TrafficLimit,
+		StatsServerIDs:            file.StatsServerIDs,
+		CreatedAt:                 file.CreatedAt,
+		UpdatedAt:                 file.UpdatedAt,
 	}
 }
 
@@ -1027,13 +835,38 @@ func (h *subscribeFilesHandler) convertSubscribeFilesWithVersions(ctx context.Co
 	return result
 }
 
-// 保存生成的配置为订阅文件
+func parseExpireAt(raw *string) (*time.Time, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	value := strings.TrimSpace(*raw)
+	if value == "" {
+		return nil, nil
+	}
+	// Try RFC3339 first (without milliseconds)
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		// Fallback to RFC3339Nano (with milliseconds/nanoseconds)
+		parsed, err = time.Parse(time.RFC3339Nano, value)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &parsed, nil
+}
+
+// handleCreateFromConfig 保存生成的配置为订阅文件
 func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
-		Filename    string `json:"filename"`
-		Content     string `json:"content"`
+		Name             string   `json:"name"`
+		Description      string   `json:"description"`
+		Filename         string   `json:"filename"`
+		Content          string   `json:"content"`
+		TemplateFilename string   `json:"template_filename"` // V3 模板文件名
+		SelectedTags     []string `json:"selected_tags"`     // V3 legacy:按标签选节点
+		SelectedNodeIDs  []int64  `json:"selected_node_ids"` // V3 新:按节点 ID 精确选;非空优先于 SelectedTags
+		TrafficLimit     *float64 `json:"traffic_limit"`
+		StatsServerIDs   string   `json:"stats_server_ids"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1057,9 +890,9 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 		// 获取用户设置
 		settings, err := h.repo.GetUserSettings(r.Context(), username)
 		if err == nil {
-			// 只有在使用新模板系统时才进行校验
-			shouldValidate = settings.UseNewTemplateSystem
-			logger.Info("[创建订阅文件] 用户设置", "username", username, "use_new_template_system", settings.UseNewTemplateSystem, "should_validate", shouldValidate)
+			// 只有在使用v2模板系统时才进行校验
+			shouldValidate = settings.TemplateVersion == "v2"
+			logger.Info("[创建订阅文件] 用户设置", "username", username, "template_version", settings.TemplateVersion, "should_validate", shouldValidate)
 		} else if !errors.Is(err, storage.ErrUserSettingsNotFound) {
 			logger.Info("[创建订阅文件] 获取用户设置失败，使用默认行为(进行校验)", "username", username, "error", err)
 		}
@@ -1071,10 +904,14 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 		filename = req.Name
 	}
 
-	// 确保文件名有.yaml或.yml扩展名
-	ext := filepath.Ext(filename)
-	if ext != ".yaml" && ext != ".yml" {
-		filename = filename + ".yaml"
+	filename, err := sanitizeSubscribeFilename(filename)
+	if err != nil {
+		writeBadRequest(w, err.Error())
+		return
+	}
+	if err := h.ensureFilenameAvailable(r.Context(), filename); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
 	}
 
 	// 验证YAML格式，使用Node API保持顺序和格式
@@ -1142,7 +979,7 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 	}
 
 	// 修复short-id字段，确保使用双引号
-	// 修复ShortIdStyleInNode(&rootNode)
+	// fixShortIdStyleInNode(&rootNode)
 
 	// 重新序列化YAML，保持原有顺序和格式
 	reserializedContent, err := MarshalYAMLWithIndent(&rootNode)
@@ -1151,7 +988,7 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 		return
 	}
 
-	// 修复表情符号/反斜杠转义
+	// Fix emoji/backslash escapes
 	fixedContent := RemoveUnicodeEscapeQuotes(string(reserializedContent))
 
 	// 保存文件到subscribes目录
@@ -1167,31 +1004,24 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 		return
 	}
 
-	// 配额校验:普通用户创建订阅受全局配额限制(admin 不限)。
-	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
-		_ = os.Remove(filePath)
-		writeError(w, http.StatusForbidden, err)
-		return
-	}
-
 	// 保存到数据库
 	file := storage.SubscribeFile{
-		Name:        req.Name,
-		Description: req.Description,
-		URL:         "",
-		Type:        storage.SubscribeTypeCreate,
-		Filename:    filename,
-		CreatedBy:   username,
+		Name:             req.Name,
+		Description:      req.Description,
+		URL:              "",
+		Type:             storage.SubscribeTypeCreate,
+		Filename:         filename,
+		TemplateFilename: req.TemplateFilename,
+		SelectedTags:     req.SelectedTags,
+		SelectedNodeIDs:  req.SelectedNodeIDs,
+		TrafficLimit:     req.TrafficLimit,
+		StatsServerIDs:   req.StatsServerIDs,
 	}
 
 	created, err := h.repo.CreateSubscribeFile(r.Context(), file)
 	if err != nil {
 		// 如果数据库保存失败，删除已保存的文件
 		_ = os.Remove(filePath)
-		if errors.Is(err, storage.ErrCustomShortCodeExists) {
-			writeError(w, http.StatusConflict, err)
-			return
-		}
 		if errors.Is(err, storage.ErrSubscribeFileExists) {
 			writeError(w, http.StatusConflict, errors.New("订阅名称已存在"))
 			return
@@ -1200,15 +1030,16 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 		return
 	}
 
-	// 初始化自定义规则应用记录以防止首次修改时出现重复
-	h.initializeCustomRuleApplications(r.Context(), created.ID)
+	// 同步 MMW 模式代理集合的节点到配置文件
+	// 使用 goroutine 异步执行，不阻塞响应
+	go h.syncMMWProxyProvidersToFile(subscribesDir, filename)
 
 	respondJSON(w, http.StatusCreated, map[string]any{
 		"file": convertSubscribeFile(created),
 	})
 }
 
-// 获取订阅文件内容
+// handleGetContent 获取订阅文件内容
 func (h *subscribeFilesHandler) handleGetContent(w http.ResponseWriter, r *http.Request, filename string) {
 	if filename == "" {
 		writeBadRequest(w, "文件名不能为空")
@@ -1223,19 +1054,13 @@ func (h *subscribeFilesHandler) handleGetContent(w http.ResponseWriter, r *http.
 	}
 
 	// 检查文件是否存在于数据库
-	sf, err := h.repo.GetSubscribeFileByFilename(r.Context(), filename)
+	_, err = h.repo.GetSubscribeFileByFilename(r.Context(), filename)
 	if err != nil {
 		if errors.Is(err, storage.ErrSubscribeFileNotFound) {
 			writeError(w, http.StatusNotFound, errors.New("订阅文件不存在"))
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	// 所有权校验:普通用户只能看自己创建的订阅内容。
-	if uname := auth.UsernameFromContext(r.Context()); !userIsAdmin(r.Context(), h.repo, uname) && sf.CreatedBy != uname {
-		writeError(w, http.StatusNotFound, errors.New("订阅文件不存在"))
 		return
 	}
 
@@ -1256,7 +1081,7 @@ func (h *subscribeFilesHandler) handleGetContent(w http.ResponseWriter, r *http.
 	})
 }
 
-// 更新订阅文件内容
+// handleUpdateContent 更新订阅文件内容
 func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *http.Request, filename string) {
 	if filename == "" {
 		writeBadRequest(w, "文件名不能为空")
@@ -1278,12 +1103,6 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	// 所有权校验:普通用户只能改自己创建的订阅内容。
-	if uname := auth.UsernameFromContext(r.Context()); !userIsAdmin(r.Context(), h.repo, uname) && subscribeFile.CreatedBy != uname {
-		writeError(w, http.StatusNotFound, errors.New("订阅文件不存在"))
 		return
 	}
 
@@ -1324,7 +1143,7 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 			if issue.Level == validator.ErrorLevel {
 				errorMsg := issue.Message
 				if issue.Location != "" {
-					errorMsg = fmt.Sprintf("%s (位��: %s)", errorMsg, issue.Location)
+					errorMsg = fmt.Sprintf("%s (位置: %s)", errorMsg, issue.Location)
 				}
 				errorMessages = append(errorMessages, errorMsg)
 				logger.Info("[更新订阅文件] [配置校验] 错误", "message", errorMsg)
@@ -1351,12 +1170,8 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// 保存版本记录(author = 当前调用者,而非硬编码 "admin")
-	author := auth.UsernameFromContext(r.Context())
-	if author == "" {
-		author = "admin"
-	}
-	version, err := h.repo.SaveRuleVersion(r.Context(), filename, contentToSave, author)
+	// 保存版本记录
+	version, err := h.repo.SaveRuleVersion(r.Context(), filename, contentToSave, "admin")
 	if err != nil {
 		// 版本保存失败不影响文件保存，只记录错误
 		writeError(w, http.StatusInternalServerError, errors.New("保存版本记录失败"))
@@ -1378,107 +1193,664 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 	})
 }
 
-// initializeCustomRuleApplications 记录新创建的订阅文件的初始自定义规则应用程序状态。
-// 当从内容中已包含自定义规则的生成器页面创建文件时，会调用此方法。
-// 我们只记录应用程序状态，而不重新应用规则（这会重复它们）。
-func (h *subscribeFilesHandler) initializeCustomRuleApplications(ctx context.Context, fileID int64) {
-	// 获取所有已启用的自定义规则以记录其当前状态
-	rules, err := h.repo.ListEnabledCustomRules(ctx, "")
+// syncMMWProxyProvidersToFile 同步 MMW 模式代理集合的节点到指定文件
+// 保存配置文件后调用，将 proxy-groups 中 use 引用的 MMW 模式代理集合节点直接写入配置
+func (h *subscribeFilesHandler) syncMMWProxyProvidersToFile(subscribeDir, filename string) {
+	SyncMMWProxyProvidersToFile(h.repo, subscribeDir, filename)
+}
+
+// SyncMMWProxyProvidersToFile 同步 MMW 模式代理集合的节点到指定文件（公共版本）
+// 可由 subscription.go 调用，确保获取订阅时包含最新的代理集合节点
+func SyncMMWProxyProvidersToFile(repo *storage.TrafficRepository, subscribeDir, filename string) {
+	filePath := filepath.Join(subscribeDir, filename)
+
+	// 1. 读取刚保存的 YAML 文件
+	content, err := os.ReadFile(filePath)
 	if err != nil {
-		logger.Info("[Subscribe] 获取自定义规则失败", "error", err)
+		logger.Info("[MMW同步] 读取文件失败", "error", err)
 		return
 	}
 
-	if len(rules) == 0 {
+	// 2. 解析 YAML
+	var rootNode yaml.Node
+	if err := yaml.Unmarshal(content, &rootNode); err != nil {
+		logger.Info("[MMW同步] 解析YAML失败", "error", err)
 		return
 	}
 
-	// 记录每个规则的当前状态而不修改文件
-	for _, rule := range rules {
-		// 计算内容哈希以跟踪未来的变化
-		hash := sha256.Sum256([]byte(rule.Content))
-		contentHash := hex.EncodeToString(hash[:])
+	// 3. 查找 proxy-groups，收集 use 引用的代理集合名称
+	providerNames := collectUsedProviderNames(&rootNode)
+	if len(providerNames) == 0 {
+		return
+	}
 
-		// 解析规则内容以提取应用的实际规则/提供程序
-		// 这必须与 applyRulesRule 和 applyRuleProvidersRule 中使用的格式匹配
-		var appliedContent string
-		if rule.Type == "rules" {
-			// 解析规则内容，得到规则数组
-			var newRules []interface{}
+	// 获取现有节点数量用于比较
+	existingNodes := collectExistingProxyNodes(&rootNode)
+	logger.Info("[MMW同步] 文件使用代理集合", "filename", filename, "count", len(providerNames), "providers", providerNames, "existing_nodes", len(existingNodes))
 
-			// 尝试首先解析为地图（使用“rules:”键）
-			var parsedAsMap map[string]interface{}
-			if err := yaml.Unmarshal([]byte(rule.Content), &parsedAsMap); err == nil {
-				if rulesValue, hasRulesKey := parsedAsMap["rules"]; hasRulesKey {
-					if rulesArray, ok := rulesValue.([]interface{}); ok {
-						newRules = rulesArray
-					}
-				}
+	ctx := context.Background()
+	syncedCount := 0
+
+	// 4. 根据名称查找代理集合配置，筛选 MMW 模式
+	for _, providerName := range providerNames {
+		config, err := repo.GetProxyProviderConfigByName(ctx, providerName)
+		if err != nil {
+			logger.Info("[MMW同步] 查询代理集合配置失败", "provider_name", providerName, "error", err)
+			continue
+		}
+		if config == nil {
+			continue
+		}
+		if config.ProcessMode != "mmw" {
+			continue
+		}
+
+		// 5. 从缓存获取节点数据
+		cache := GetProxyProviderCache()
+		entry, ok := cache.Get(config.ID)
+		if !ok || cache.IsExpired(entry) {
+			// 缓存不存在或过期，尝试刷新
+			sub, err := repo.GetExternalSubscription(ctx, config.ExternalSubscriptionID, config.Username)
+			if err != nil || sub.ID == 0 {
+				logger.Info("[MMW同步] 获取代理集合的外部订阅失败", "provider_name", providerName, "error", err)
+				continue
 			}
+			entry, err = RefreshProxyProviderCache(&sub, config)
+			if err != nil {
+				logger.Info("[MMW同步] 刷新代理集合缓存失败", "provider_name", providerName, "error", err)
+				continue
+			}
+		}
 
-			// 尝试解析为 YAML 数组
-			if len(newRules) == 0 {
-				if err := yaml.Unmarshal([]byte(rule.Content), &newRules); err != nil {
-					// 解析为纯文本
-					lines := strings.Split(rule.Content, "\n")
-					for _, line := range lines {
-						line = strings.TrimSpace(line)
-						if line != "" && !strings.HasPrefix(line, "#") {
-							newRules = append(newRules, line)
+		if len(entry.Nodes) == 0 {
+			logger.Info("[MMW同步] 代理集合没有节点", "provider_name", providerName)
+			continue
+		}
+
+		// 6. 为节点添加前缀（使用名称前缀，即第一个 - 之前的部分）
+		namePrefix := config.Name
+		if idx := strings.Index(config.Name, "-"); idx > 0 {
+			namePrefix = config.Name[:idx]
+		}
+		prefix := fmt.Sprintf("〖%s〗", namePrefix)
+
+		// 复制节点并添加前缀
+		proxiesRaw := make([]any, len(entry.Nodes))
+		nodeNames := make([]string, 0, len(entry.Nodes))
+		for i, node := range entry.Nodes {
+			nodeCopy := copyMap(node.(map[string]any))
+			if name, ok := nodeCopy["name"].(string); ok {
+				newName := prefix + name
+				nodeCopy["name"] = newName
+				nodeNames = append(nodeNames, newName)
+			}
+			proxiesRaw[i] = nodeCopy
+		}
+
+		// 7. 调用已有的同步函数写入节点
+		if err := updateYAMLFileWithProxyProviderNodes(subscribeDir, filename, config.Name, prefix, proxiesRaw, nodeNames); err != nil {
+			logger.Info("[MMW同步] 更新文件失败", "filename", filename, "error", err)
+			continue
+		}
+
+		// 记录同步完成（详细的 old_count/new_count 日志已在 external_sync.go 中输出）
+		logger.Info("[MMW同步] 代理集合同步完成", "provider_name", providerName, "node_count", len(nodeNames))
+
+		syncedCount++
+	}
+
+	if syncedCount > 0 {
+		logger.Info("[MMW同步] 文件同步完成", "filename", filename, "synced_count", syncedCount)
+	}
+}
+
+// collectExistingProxyNodes 从 YAML 中收集现有的 proxies 节点名称
+func collectExistingProxyNodes(rootNode *yaml.Node) []string {
+	nodeNames := make([]string, 0)
+
+	if rootNode.Kind != yaml.DocumentNode || len(rootNode.Content) == 0 {
+		return nodeNames
+	}
+
+	docContent := rootNode.Content[0]
+	if docContent.Kind != yaml.MappingNode {
+		return nodeNames
+	}
+
+	// 查找 proxies 节点
+	var proxiesNode *yaml.Node
+	for i := 0; i < len(docContent.Content)-1; i += 2 {
+		keyNode := docContent.Content[i]
+		valueNode := docContent.Content[i+1]
+		if keyNode.Kind == yaml.ScalarNode && keyNode.Value == "proxies" {
+			proxiesNode = valueNode
+			break
+		}
+	}
+
+	if proxiesNode == nil || proxiesNode.Kind != yaml.SequenceNode {
+		return nodeNames
+	}
+
+	// 遍历 proxies，收集 name 字段
+	for _, proxyNode := range proxiesNode.Content {
+		if proxyNode.Kind != yaml.MappingNode {
+			continue
+		}
+		for i := 0; i < len(proxyNode.Content)-1; i += 2 {
+			keyNode := proxyNode.Content[i]
+			valueNode := proxyNode.Content[i+1]
+			if keyNode.Kind == yaml.ScalarNode && keyNode.Value == "name" && valueNode.Kind == yaml.ScalarNode {
+				nodeNames = append(nodeNames, valueNode.Value)
+				break
+			}
+		}
+	}
+
+	return nodeNames
+}
+
+// collectUsedProviderNames 从 YAML 中收集所有 proxy-groups 的代理集合引用
+// 支持两种模式：
+// 1. 客户端模式：从 use 字段收集 provider 名称
+// 2. 妙妙屋模式：从 proxy-group 的 name 字段收集（MMW模式下 proxy-group 名称与代理集合名称相同）
+func collectUsedProviderNames(rootNode *yaml.Node) []string {
+	providerNames := make([]string, 0)
+	seen := make(map[string]bool)
+
+	if rootNode.Kind != yaml.DocumentNode || len(rootNode.Content) == 0 {
+		return providerNames
+	}
+
+	docContent := rootNode.Content[0]
+	if docContent.Kind != yaml.MappingNode {
+		return providerNames
+	}
+
+	// 查找 proxy-groups 节点
+	var proxyGroupsNode *yaml.Node
+	for i := 0; i < len(docContent.Content)-1; i += 2 {
+		keyNode := docContent.Content[i]
+		valueNode := docContent.Content[i+1]
+		if keyNode.Kind == yaml.ScalarNode && keyNode.Value == "proxy-groups" {
+			proxyGroupsNode = valueNode
+			break
+		}
+	}
+
+	if proxyGroupsNode == nil || proxyGroupsNode.Kind != yaml.SequenceNode {
+		return providerNames
+	}
+
+	// 遍历 proxy-groups
+	for _, groupNode := range proxyGroupsNode.Content {
+		if groupNode.Kind != yaml.MappingNode {
+			continue
+		}
+
+		var groupName string
+		var hasUse bool
+
+		for i := 0; i < len(groupNode.Content)-1; i += 2 {
+			keyNode := groupNode.Content[i]
+			valueNode := groupNode.Content[i+1]
+
+			if keyNode.Kind == yaml.ScalarNode {
+				switch keyNode.Value {
+				case "name":
+					if valueNode.Kind == yaml.ScalarNode {
+						groupName = valueNode.Value
+					}
+				case "use":
+					hasUse = true
+					// 客户端模式：收集 use 字段的值
+					if valueNode.Kind == yaml.SequenceNode {
+						for _, useItem := range valueNode.Content {
+							if useItem.Kind == yaml.ScalarNode && useItem.Value != "" {
+								if !seen[useItem.Value] {
+									seen[useItem.Value] = true
+									providerNames = append(providerNames, useItem.Value)
+								}
+							}
 						}
 					}
 				}
 			}
-
-			// 序列化为 JSON 格式（与 applyRulesRule 相同）
-			if len(newRules) > 0 {
-				appliedJSON, _ := json.Marshal(newRules)
-				appliedContent = string(appliedJSON)
-			}
-		} else if rule.Type == "rule-providers" {
-			// 解析规则提供者内容
-			var parsedContent map[string]interface{}
-			if err := yaml.Unmarshal([]byte(rule.Content), &parsedContent); err == nil {
-				var providersMap map[string]interface{}
-				if providersValue, hasProvidersKey := parsedContent["rule-providers"]; hasProvidersKey {
-					if pm, ok := providersValue.(map[string]interface{}); ok {
-						providersMap = pm
-					}
-				} else {
-					providersMap = parsedContent
-				}
-
-				// 序列化为JSON格式
-				if len(providersMap) > 0 {
-					appliedJSON, _ := json.Marshal(providersMap)
-					appliedContent = string(appliedJSON)
-				}
-			}
-		} else if rule.Type == "dns" {
-			// 对于 DNS 规则，我们不跟踪应用的内容
-			appliedContent = ""
 		}
 
-		app := &storage.CustomRuleApplication{
-			SubscribeFileID: fileID,
-			CustomRuleID:    rule.ID,
-			RuleType:        rule.Type,
-			RuleMode:        rule.Mode,
-			AppliedContent:  appliedContent,
-			ContentHash:     contentHash,
-		}
-
-		if err := h.repo.UpsertCustomRuleApplication(ctx, app); err != nil {
-			logger.Info("[Subscribe] 记录自定义规则应用失败", "rule_id", rule.ID, "error", err)
+		// 妙妙屋模式：如果没有 use 字段，使用 proxy-group 的 name
+		if !hasUse && groupName != "" && !seen[groupName] {
+			seen[groupName] = true
+			providerNames = append(providerNames, groupName)
 		}
 	}
 
-	logger.Info("[Subscribe] 记录自定义规则应用状态完成", "rule_count", len(rules), "file_id", fileID)
+	return providerNames
 }
 
+// copyMap 深拷贝 map
+func copyMap(m map[string]any) map[string]any {
+	result := make(map[string]any)
+	for k, v := range m {
+		switch vv := v.(type) {
+		case map[string]any:
+			result[k] = copyMap(vv)
+		case []any:
+			newSlice := make([]any, len(vv))
+			copy(newSlice, vv)
+			result[k] = newSlice
+		default:
+			result[k] = v
+		}
+	}
+	return result
+}
 
-// handleGetSubscriptionUsers GET /api/admin/subscribe-files/{id}/users
-// 返回该订阅文件分配给哪些用户 + 各自的 user_short_code / custom_user_short_code(同步自 mmw v0.7.3)
+// handleCreateAggregate 聚合多个标签(通常为外部订阅名称)为一个新订阅。
+// 使用 selected_tags 动态绑定节点：源订阅更新后，聚合订阅在获取时也会反映最新节点集合。
+// 可选绑定 V3 模板；未绑定时按标签实时生成精简 Clash 配置。
+func (h *subscribeFilesHandler) handleCreateAggregate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name             string   `json:"name"`
+		Description      string   `json:"description"`
+		Filename         string   `json:"filename"`
+		SelectedTags     []string `json:"selected_tags"`
+		TemplateFilename string   `json:"template_filename"`
+		TrafficLimit     *float64 `json:"traffic_limit"`
+		StatsServerIDs   string   `json:"stats_server_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeBadRequest(w, "请求格式不正确")
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeBadRequest(w, "订阅名称是必填项")
+		return
+	}
+
+	// normalize tags
+	tagSet := make(map[string]struct{})
+	var tags []string
+	for _, t := range req.SelectedTags {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		if _, ok := tagSet[t]; ok {
+			continue
+		}
+		tagSet[t] = struct{}{}
+		tags = append(tags, t)
+	}
+	if len(tags) == 0 {
+		writeBadRequest(w, "请至少选择一个源订阅/标签")
+		return
+	}
+
+	username := auth.UsernameFromContext(r.Context())
+	if username == "" {
+		writeError(w, http.StatusUnauthorized, errors.New("未登录"))
+		return
+	}
+
+	filename := strings.TrimSpace(req.Filename)
+	if filename == "" {
+		filename = req.Name
+	}
+	filename, err := sanitizeSubscribeFilename(filename)
+	if err != nil {
+		writeBadRequest(w, err.Error())
+		return
+	}
+	if err := h.ensureFilenameAvailable(r.Context(), filename); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+
+	description := strings.TrimSpace(req.Description)
+	if description == "" {
+		description = "聚合订阅: " + strings.Join(tags, ", ")
+	}
+
+	// Build initial content (also used as fallback file on disk)
+	content, err := buildAggregateConfigContent(r.Context(), h.repo, username, tags, strings.TrimSpace(req.TemplateFilename))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	subscribesDir := "subscribes"
+	if err := os.MkdirAll(subscribesDir, 0755); err != nil {
+		writeError(w, http.StatusInternalServerError, errors.New("创建订阅目录失败"))
+		return
+	}
+	filePath := filepath.Join(subscribesDir, filename)
+	if err := os.WriteFile(filePath, content, 0644); err != nil {
+		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
+		return
+	}
+
+	file := storage.SubscribeFile{
+		Name:             req.Name,
+		Description:      description,
+		URL:              "",
+		Type:             storage.SubscribeTypeCreate,
+		Filename:         filename,
+		TemplateFilename: strings.TrimSpace(req.TemplateFilename),
+		SelectedTags:     tags,
+		SelectedNodeIDs:  nil, // 必须为空：按标签动态跟踪源订阅节点变化
+		TrafficLimit:     req.TrafficLimit,
+		StatsServerIDs:   req.StatsServerIDs,
+	}
+
+	created, err := h.repo.CreateSubscribeFile(r.Context(), file)
+	if err != nil {
+		_ = os.Remove(filePath)
+		if errors.Is(err, storage.ErrSubscribeFileExists) {
+			writeError(w, http.StatusConflict, errors.New("订阅名称已存在"))
+			return
+		}
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// 若绑定了模板，异步再刷一次确保与 regenerateFromTemplate 一致
+	if created.TemplateFilename != "" {
+		go func() {
+			ctx := context.Background()
+			if err := h.regenerateFromTemplate(ctx, username, created); err != nil {
+				logger.Info("[聚合订阅] 模板生成失败", "subscribe", created.Name, "error", err)
+			}
+		}()
+	}
+
+	respondJSON(w, http.StatusCreated, map[string]any{
+		"file": convertSubscribeFile(created),
+	})
+}
+
+// buildAggregateConfigContent 生成聚合订阅的初始 YAML 内容。
+// 有模板时走模板处理；无模板时生成精简 Clash 配置(proxies + 默认选择组)。
+func buildAggregateConfigContent(ctx context.Context, repo *storage.TrafficRepository, username string, tags []string, templateFilename string) ([]byte, error) {
+	nodes, err := repo.ListNodes(ctx, username)
+	if err != nil {
+		return nil, fmt.Errorf("获取节点列表失败: %w", err)
+	}
+
+	selectedTagsMap := make(map[string]bool, len(tags))
+	for _, t := range tags {
+		selectedTagsMap[t] = true
+	}
+
+	var proxies []map[string]any
+	var proxyNames []string
+	for _, node := range nodes {
+		if !node.Enabled {
+			continue
+		}
+		if !node.HasAnyTag(selectedTagsMap) {
+			continue
+		}
+		var proxyConfig map[string]any
+		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
+			continue
+		}
+		proxyConfig["name"] = node.NodeName
+		proxies = append(proxies, proxyConfig)
+		proxyNames = append(proxyNames, node.NodeName)
+	}
+
+	if templateFilename != "" {
+		templatePath := filepath.Join("rule_templates", templateFilename)
+		templateContent, err := os.ReadFile(templatePath)
+		if err != nil {
+			return nil, fmt.Errorf("读取模板文件失败: %w", err)
+		}
+		// providers map 留空即可；模板处理器主要消费 proxies
+		processor := substore.NewTemplateV3Processor(nil, map[string][]string{})
+		result, err := processor.ProcessTemplate(string(templateContent), proxies)
+		if err != nil {
+			return nil, fmt.Errorf("处理模板失败: %w", err)
+		}
+		result, err = injectProxiesIntoTemplate(result, proxies)
+		if err != nil {
+			return nil, fmt.Errorf("注入代理节点失败: %w", err)
+		}
+		return []byte(result), nil
+	}
+
+	// 无模板：精简配置，客户端可直接使用
+	groupProxies := append([]string{}, proxyNames...)
+	groupProxies = append(groupProxies, "DIRECT")
+	cfg := map[string]any{
+		"mixed-port":          7890,
+		"allow-lan":           true,
+		"mode":                "rule",
+		"log-level":           "info",
+		"external-controller": "127.0.0.1:9090",
+		"proxies":             proxies,
+		"proxy-groups": []map[string]any{
+			{
+				"name":    "PROXY",
+				"type":    "select",
+				"proxies": groupProxies,
+			},
+		},
+		"rules": []string{
+			"MATCH,PROXY",
+		},
+	}
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("序列化配置失败: %w", err)
+	}
+	return out, nil
+}
+
+// regenerateFromTemplate 从V3模板重新生成订阅文件
+func (h *subscribeFilesHandler) regenerateFromTemplate(ctx context.Context, username string, subscribeFile storage.SubscribeFile) error {
+	if subscribeFile.TemplateFilename == "" {
+		return errors.New("订阅未绑定模板")
+	}
+
+	// 1. 读取模板文件
+	templatePath := filepath.Join("rule_templates", subscribeFile.TemplateFilename)
+	templateContent, err := os.ReadFile(templatePath)
+	if err != nil {
+		return fmt.Errorf("读取模板文件失败: %w", err)
+	}
+	logger.Info("[模板生成] 读取模板文件", "template", subscribeFile.TemplateFilename, "bytes", len(templateContent))
+
+	// 2. 从节点表获取用户的所有代理节点
+	nodes, err := h.repo.ListNodes(ctx, username)
+	if err != nil {
+		return fmt.Errorf("获取节点列表失败: %w", err)
+	}
+
+	// 优先按节点 ID 过滤(新模式);为空回退按标签过滤(legacy 兼容)
+	selectedNodeIDsMap := make(map[int64]bool, len(subscribeFile.SelectedNodeIDs))
+	for _, id := range subscribeFile.SelectedNodeIDs {
+		selectedNodeIDsMap[id] = true
+	}
+	hasNodeFilter := len(selectedNodeIDsMap) > 0
+
+	selectedTagsMap := make(map[string]bool)
+	for _, tag := range subscribeFile.SelectedTags {
+		selectedTagsMap[tag] = true
+	}
+	hasTagFilter := !hasNodeFilter && len(selectedTagsMap) > 0
+
+	if hasNodeFilter {
+		logger.Info("[模板生成] 启用节点过滤", "selected_node_ids", subscribeFile.SelectedNodeIDs, "count", len(subscribeFile.SelectedNodeIDs))
+	} else if hasTagFilter {
+		logger.Info("[模板生成] 启用标签过滤(legacy)", "selected_tags", subscribeFile.SelectedTags, "tag_count", len(subscribeFile.SelectedTags))
+	}
+
+	// 构建节点 ID -> 名称映射（用于链式代理解析）
+	nodeIDToName := make(map[int64]string, len(nodes))
+	for _, node := range nodes {
+		nodeIDToName[node.ID] = node.NodeName
+	}
+
+	// 将节点转换为 proxies 格式（[]map[string]any）
+	var proxies []map[string]any
+	enabledCount := 0
+	filteredByTagCount := 0
+	for _, node := range nodes {
+		if !node.Enabled {
+			continue // 跳过禁用的节点
+		}
+		enabledCount++
+		// 节点 ID 精确过滤优先(新模式)
+		if hasNodeFilter && !selectedNodeIDsMap[node.ID] {
+			filteredByTagCount++
+			continue
+		}
+		// 如果设置了标签过滤，只使用选中标签的节点(legacy fallback)
+		if hasTagFilter && !node.HasAnyTag(selectedTagsMap) {
+			filteredByTagCount++
+			continue
+		}
+		// ClashConfig 是 JSON 格式的字符串，需要解析
+		var proxyConfig map[string]any
+		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
+			logger.Info("[模板生成] 解析节点配置失败，跳过", "node", node.NodeName, "error", err)
+			continue
+		}
+		// 确保节点名称正确（使用数据库中的名称）
+		proxyConfig["name"] = node.NodeName
+		// 链式代理：根据 chain_proxy_node_id 注入 dialer-proxy
+		if node.ChainProxyNodeID != nil {
+			if targetName, ok := nodeIDToName[*node.ChainProxyNodeID]; ok {
+				proxyConfig["dialer-proxy"] = targetName
+			}
+		}
+		proxies = append(proxies, proxyConfig)
+	}
+	logger.Info("[模板生成] 从节点表获取代理节点", "total", len(nodes), "enabled", enabledCount, "filtered_by_tag", filteredByTagCount, "used", len(proxies))
+
+	// 3. 从代理集合表获取用户的代理集合配置（用于 proxy-providers）
+	providerConfigs, err := h.repo.ListProxyProviderConfigs(ctx, username)
+	if err != nil {
+		logger.Info("[模板生成] 获取代理集合配置失败", "error", err)
+		// 不是致命错误，继续处理
+	}
+
+	// 构建 providers map：provider name -> proxy names
+	providers := make(map[string][]string)
+	providerTagSet := make(map[string]bool)
+	for _, config := range providerConfigs {
+		providerTagSet[config.Name] = true
+	}
+	if len(providerTagSet) > 0 {
+		for _, node := range nodes {
+			if !node.Enabled {
+				continue
+			}
+			for _, t := range node.Tags {
+				if providerTagSet[t] {
+					providers[t] = append(providers[t], node.NodeName)
+				}
+			}
+		}
+	}
+	logger.Info("[模板生成] 从代理集合表获取代理集合", "count", len(providerConfigs), "with_nodes", len(providers))
+
+	// 4. 使用 TemplateV3Processor 处理模板
+	processor := substore.NewTemplateV3Processor(nil, providers)
+	result, err := processor.ProcessTemplate(string(templateContent), proxies)
+	if err != nil {
+		return fmt.Errorf("处理模板失败: %w", err)
+	}
+
+	// 5. 注入代理节点到proxies字段（与预览保持一致）
+	result, err = injectProxiesIntoTemplate(result, proxies)
+	if err != nil {
+		return fmt.Errorf("注入代理节点失败: %w", err)
+	}
+
+	// 5.5 孤儿节点裁剪:顶层 proxies: 只保留被 proxy-groups 实际引用的节点
+	if pruned, perr := pruneUnreferencedProxiesYAML([]byte(result)); perr == nil {
+		result = string(pruned)
+	} else {
+		logger.Info("[模板生成] 孤儿裁剪跳过", "error", perr.Error())
+	}
+
+	// 6. 写入订阅文件
+	subscribePath := filepath.Join("subscribes", subscribeFile.Filename)
+	if err := os.WriteFile(subscribePath, []byte(result), 0644); err != nil {
+		return fmt.Errorf("写入订阅文件失败: %w", err)
+	}
+
+	logger.Info("[模板生成] 模板处理完成", "subscribe", subscribeFile.Name, "template", subscribeFile.TemplateFilename, "result_bytes", len(result))
+	return nil
+}
+
+// RefreshAllTemplateSubscriptions 刷新所有绑定了模板的订阅
+// 当节点发生变化（新增、删除、修改）时调用此函数
+func RefreshAllTemplateSubscriptions(repo *storage.TrafficRepository, username string) {
+	ctx := context.Background()
+
+	// 获取所有绑定了模板的订阅
+	files, err := repo.GetSubscribeFilesWithTemplate(ctx)
+	if err != nil {
+		logger.Info("[模板刷新] 获取绑定模板的订阅失败", "error", err)
+		return
+	}
+
+	if len(files) == 0 {
+		logger.Info("[模板刷新] 没有绑定模板的订阅需要刷新")
+		return
+	}
+
+	logger.Info("[模板刷新] 开始刷新绑定模板的订阅", "count", len(files))
+
+	// 创建临时 handler 用于调用 regenerateFromTemplate
+	h := &subscribeFilesHandler{repo: repo}
+
+	successCount := 0
+	for _, file := range files {
+		if err := h.regenerateFromTemplate(ctx, username, file); err != nil {
+			logger.Info("[模板刷新] 刷新订阅失败", "subscribe", file.Name, "template", file.TemplateFilename, "error", err)
+		} else {
+			logger.Info("[模板刷新] 刷新订阅成功", "subscribe", file.Name, "template", file.TemplateFilename)
+			successCount++
+		}
+	}
+
+	logger.Info("[模板刷新] 刷新完成", "total", len(files), "success", successCount)
+}
+
+// RefreshSubscriptionsByTemplate 刷新绑定了指定模板的订阅
+func RefreshSubscriptionsByTemplate(repo *storage.TrafficRepository, username string, templateFilename string) {
+	ctx := context.Background()
+
+	files, err := repo.GetSubscribeFilesByTemplate(ctx, templateFilename)
+	if err != nil {
+		logger.Info("[模板刷新] 获取绑定模板的订阅失败", "template", templateFilename, "error", err)
+		return
+	}
+	if len(files) == 0 {
+		return
+	}
+
+	logger.Info("[模板刷新] 开始刷新绑定指定模板的订阅", "template", templateFilename, "count", len(files))
+
+	h := &subscribeFilesHandler{repo: repo}
+	successCount := 0
+	for _, file := range files {
+		if err := h.regenerateFromTemplate(ctx, username, file); err != nil {
+			logger.Info("[模板刷新] 刷新订阅失败", "subscribe", file.Name, "error", err)
+		} else {
+			successCount++
+		}
+	}
+
+	logger.Info("[模板刷新] 刷新完成", "template", templateFilename, "total", len(files), "success", successCount)
+}
+
 func (h *subscribeFilesHandler) handleGetSubscriptionUsers(w http.ResponseWriter, r *http.Request, idStr string) {
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
@@ -1498,33 +1870,64 @@ func (h *subscribeFilesHandler) handleGetSubscriptionUsers(w http.ResponseWriter
 	respondJSON(w, http.StatusOK, map[string]any{"users": users})
 }
 
-// filterAdminVisibleSubscribeFiles 给 admin 视角的 handleList 用 — 隐藏掉普通用户私创的订阅文件。
-// 实现:对所有 distinct created_by 一次性查 role,O(distinct creators) 次 GetUser,避免每条订阅 N+1。
-//   - created_by 空 → 保留(无主历史数据)
-//   - created_by == self(当前 admin) → 保留
-//   - created_by 是另一个 admin → 保留(admin 之间互见)
-//   - created_by 是普通用户 → 隐藏(该用户私创的"生成订阅",不应被其他 admin 看到)
-func filterAdminVisibleSubscribeFiles(ctx context.Context, repo *storage.TrafficRepository, files []storage.SubscribeFile, self string) []storage.SubscribeFile {
-	if len(files) == 0 {
-		return files
+// pruneUnreferencedProxiesYAML 顶层 proxies: 数组里删掉没被任何 proxy-group 引用的孤儿节点。
+// 复用 substore.CollectUsedProxyNamesFromGroups 拿 used 集合。
+// 解析/重排失败时返回原数据 + error,调用方决定 fallback(通常 logger.Info 即可不阻塞)。
+func pruneUnreferencedProxiesYAML(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return data, nil
 	}
-	creators := map[string]struct{}{}
-	for _, f := range files {
-		if f.CreatedBy != "" && f.CreatedBy != self {
-			creators[f.CreatedBy] = struct{}{}
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return data, err
+	}
+	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
+		return data, nil
+	}
+	doc := root.Content[0]
+	var proxiesNode, groupsNode *yaml.Node
+	for i := 0; i < len(doc.Content)-1; i += 2 {
+		switch doc.Content[i].Value {
+		case "proxies":
+			proxiesNode = doc.Content[i+1]
+		case "proxy-groups":
+			groupsNode = doc.Content[i+1]
 		}
 	}
-	adminCreators := make(map[string]bool, len(creators))
-	for c := range creators {
-		if u, err := repo.GetUser(ctx, c); err == nil && u.Role == storage.RoleAdmin {
-			adminCreators[c] = true
+	if groupsNode == nil || proxiesNode == nil || proxiesNode.Kind != yaml.SequenceNode {
+		return data, nil
+	}
+	used := substore.CollectUsedProxyNamesFromGroups(groupsNode)
+	if len(used) == 0 {
+		return data, nil
+	}
+	kept := make([]*yaml.Node, 0, len(proxiesNode.Content))
+	removed := 0
+	for _, item := range proxiesNode.Content {
+		if item.Kind != yaml.MappingNode {
+			kept = append(kept, item)
+			continue
+		}
+		var name string
+		for j := 0; j < len(item.Content)-1; j += 2 {
+			if item.Content[j].Value == "name" {
+				name = item.Content[j+1].Value
+				break
+			}
+		}
+		if name == "" || used[name] {
+			kept = append(kept, item)
+		} else {
+			removed++
 		}
 	}
-	out := make([]storage.SubscribeFile, 0, len(files))
-	for _, f := range files {
-		if f.CreatedBy == "" || f.CreatedBy == self || adminCreators[f.CreatedBy] {
-			out = append(out, f)
-		}
+	if removed == 0 {
+		return data, nil
 	}
-	return out
+	proxiesNode.Content = kept
+	out, err := MarshalYAMLWithIndent(&root)
+	if err != nil {
+		return data, err
+	}
+	return []byte(RemoveUnicodeEscapeQuotes(string(out))), nil
 }

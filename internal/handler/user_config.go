@@ -10,43 +10,90 @@ import (
 	"strings"
 
 	"miaomiaowux/internal/auth"
+	"miaomiaowux/internal/notify"
 	"miaomiaowux/internal/storage"
 )
 
 type userConfigRequest struct {
-	ForceSyncExternal       bool    `json:"force_sync_external"`
-	MatchRule               string  `json:"match_rule"`
-	SyncScope               string  `json:"sync_scope"`
-	KeepNodeName            bool    `json:"keep_node_name"`
-	CacheExpireMinutes      int     `json:"cache_expire_minutes"`
-	SyncTraffic             bool    `json:"sync_traffic"`
-	NodeNameFilter          string  `json:"node_name_filter"`
-	AppendSubInfo           bool    `json:"append_sub_info"`
-	CustomRulesEnabled      bool    `json:"custom_rules_enabled"`
-	EnableShortLink         bool    `json:"enable_short_link"`
-	UseNewTemplateSystem    *bool    `json:"use_new_template_system"` // nil表示不提供，默认true
-	EnableProxyProvider     bool     `json:"enable_proxy_provider"`
-	NodeOrder               *[]int64 `json:"node_order"` // 指针:nil=未提供(如系统设置页)→保留原值,非nil=覆盖。防止其它设置页误清节点顺序
-	ProxyGroupsSourceURL    string   `json:"proxy_groups_source_url"`
-	ClientCompatibilityMode bool    `json:"client_compatibility_mode"` // 自动过滤客户端不兼容的节点
+	ForceSyncExternal        bool    `json:"force_sync_external"`
+	MatchRule                string  `json:"match_rule"`
+	SyncScope                string  `json:"sync_scope"`
+	KeepNodeName             bool    `json:"keep_node_name"`
+	CacheExpireMinutes       int     `json:"cache_expire_minutes"`
+	SyncTraffic              bool    `json:"sync_traffic"`
+	EnableProbeBinding       bool    `json:"enable_probe_binding"`
+	CustomRulesEnabled       bool    `json:"custom_rules_enabled"`
+	EnableShortLink          bool    `json:"enable_short_link"`
+	TemplateVersion          string  `json:"template_version"`
+	EnableProxyProvider      bool    `json:"enable_proxy_provider"`
+	NodeOrder                []int64 `json:"node_order"`
+	NodeNameFilter           string  `json:"node_name_filter"`
+	AppendSubInfo            bool    `json:"append_sub_info"`
+	ProxyGroupsSourceURL     string  `json:"proxy_groups_source_url"`
+	ClientCompatibilityMode  bool    `json:"client_compatibility_mode"`
+	SilentMode               bool    `json:"silent_mode"`
+	SilentModeTimeout        int     `json:"silent_mode_timeout"`
+	EnableSubInfoNodes       bool    `json:"enable_sub_info_nodes"`
+	SubInfoV2RayOnly         bool    `json:"sub_info_v2ray_only"`
+	SubInfoExpirePrefix      string  `json:"sub_info_expire_prefix"`
+	SubInfoTrafficPrefix     string  `json:"sub_info_traffic_prefix"`
+	EnableSubTrafficHeader   bool    `json:"enable_sub_traffic_header"`
+	EnableOverrideScripts    bool    `json:"enable_override_scripts"`
+	SubscriptionOutputFormat string  `json:"subscription_output_format"`
+	// 安全配置
+	LoginRateMaxAttempts    int  `json:"login_rate_max_attempts"`
+	LoginRateWindow         int  `json:"login_rate_window"`
+	LoginRateLockDuration   int  `json:"login_rate_lock_duration"`
+	BruteForceEnabled       bool `json:"brute_force_enabled"`
+	BruteForceMaxFailures   int  `json:"brute_force_max_failures"`
+	BruteForceWindow        int  `json:"brute_force_window"`
+	BruteForceBlockDuration int  `json:"brute_force_block_duration"`
+	SubRateLimitEnabled     bool `json:"sub_rate_limit_enabled"`
+	SubRateLimitMax         int  `json:"sub_rate_limit_max"`
+	SubRateLimitWindow      int  `json:"sub_rate_limit_window"`
+	SkipLocalIP             bool `json:"skip_local_ip"`
+	BlockUnknownSubUA       bool `json:"block_unknown_subscription_ua"`
 }
 
 type userConfigResponse struct {
-	ForceSyncExternal       bool    `json:"force_sync_external"`
-	MatchRule               string  `json:"match_rule"`
-	SyncScope               string  `json:"sync_scope"`
-	KeepNodeName            bool    `json:"keep_node_name"`
-	CacheExpireMinutes      int     `json:"cache_expire_minutes"`
-	SyncTraffic             bool    `json:"sync_traffic"`
-	NodeNameFilter          string  `json:"node_name_filter"`
-	AppendSubInfo           bool    `json:"append_sub_info"`
-	CustomRulesEnabled      bool    `json:"custom_rules_enabled"`
-	EnableShortLink         bool    `json:"enable_short_link"`
-	UseNewTemplateSystem    bool    `json:"use_new_template_system"`
-	EnableProxyProvider     bool    `json:"enable_proxy_provider"`
-	NodeOrder               []int64 `json:"node_order"` // 节点显示顺序（节点 ID 数组）
-	ProxyGroupsSourceURL    string  `json:"proxy_groups_source_url"`
-	ClientCompatibilityMode bool    `json:"client_compatibility_mode"` // 自动过滤客户端不兼容的节点
+	ForceSyncExternal        bool    `json:"force_sync_external"`
+	MatchRule                string  `json:"match_rule"`
+	SyncScope                string  `json:"sync_scope"`
+	KeepNodeName             bool    `json:"keep_node_name"`
+	CacheExpireMinutes       int     `json:"cache_expire_minutes"`
+	SyncTraffic              bool    `json:"sync_traffic"`
+	EnableProbeBinding       bool    `json:"enable_probe_binding"`
+	CustomRulesEnabled       bool    `json:"custom_rules_enabled"`
+	EnableShortLink          bool    `json:"enable_short_link"`
+	TemplateVersion          string  `json:"template_version"`
+	EnableProxyProvider      bool    `json:"enable_proxy_provider"`
+	NodeOrder                []int64 `json:"node_order"`
+	NodeNameFilter           string  `json:"node_name_filter"`
+	AppendSubInfo            bool    `json:"append_sub_info"`
+	ProxyGroupsSourceURL     string  `json:"proxy_groups_source_url"`
+	ClientCompatibilityMode  bool    `json:"client_compatibility_mode"`
+	SilentMode               bool    `json:"silent_mode"`
+	SilentModeTimeout        int     `json:"silent_mode_timeout"`
+	EnableSubInfoNodes       bool    `json:"enable_sub_info_nodes"`
+	SubInfoV2RayOnly         bool    `json:"sub_info_v2ray_only"`
+	SubInfoExpirePrefix      string  `json:"sub_info_expire_prefix"`
+	SubInfoTrafficPrefix     string  `json:"sub_info_traffic_prefix"`
+	EnableSubTrafficHeader   bool    `json:"enable_sub_traffic_header"`
+	EnableOverrideScripts    bool    `json:"enable_override_scripts"`
+	SubscriptionOutputFormat string  `json:"subscription_output_format"`
+	// 安全配置
+	LoginRateMaxAttempts    int  `json:"login_rate_max_attempts"`
+	LoginRateWindow         int  `json:"login_rate_window"`
+	LoginRateLockDuration   int  `json:"login_rate_lock_duration"`
+	BruteForceEnabled       bool `json:"brute_force_enabled"`
+	BruteForceMaxFailures   int  `json:"brute_force_max_failures"`
+	BruteForceWindow        int  `json:"brute_force_window"`
+	BruteForceBlockDuration int  `json:"brute_force_block_duration"`
+	SubRateLimitEnabled     bool `json:"sub_rate_limit_enabled"`
+	SubRateLimitMax         int  `json:"sub_rate_limit_max"`
+	SubRateLimitWindow      int  `json:"sub_rate_limit_window"`
+	SkipLocalIP             bool `json:"skip_local_ip"`
+	BlockUnknownSubUA       bool `json:"block_unknown_subscription_ua"`
 }
 
 func NewUserConfigHandler(repo *storage.TrafficRepository) http.Handler {
@@ -83,23 +130,45 @@ func handleGetUserConfig(w http.ResponseWriter, r *http.Request, repo *storage.T
 	settings, err := repo.GetUserSettings(r.Context(), username)
 	if err != nil {
 		if errors.Is(err, storage.ErrUserSettingsNotFound) {
-			// 如果找不到则返回默认设置(NodeOrder 用 admin 排序作 fallback)
+			// Return default settings if not found
 			resp := userConfigResponse{
-				ForceSyncExternal:       false,
-				MatchRule:               "node_name",
-				SyncScope:               "saved_only",
-				KeepNodeName:            true,
-				CacheExpireMinutes:      0,
-				SyncTraffic:             false,
-				NodeNameFilter:          "剩余|流量|到期|订阅|时间|重置",
-				AppendSubInfo:           false,
-				CustomRulesEnabled:      true, // 自定义规则始终启用
-				EnableShortLink:         false,
-				UseNewTemplateSystem:    true, // 默认使用新模板系统
-				EnableProxyProvider:     false,
-				NodeOrder:               computeFallbackNodeOrder(r.Context(), repo, username),
-				ProxyGroupsSourceURL:    systemConfig.ProxyGroupsSourceURL,
-				ClientCompatibilityMode: systemConfig.ClientCompatibilityMode,
+				ForceSyncExternal:        false,
+				MatchRule:                "node_name",
+				SyncScope:                "saved_only",
+				KeepNodeName:             true,
+				CacheExpireMinutes:       0,
+				SyncTraffic:              false,
+				EnableProbeBinding:       false,
+				CustomRulesEnabled:       true, // 自定义规则始终启用
+				EnableShortLink:          systemConfig.EnableShortLink,
+				TemplateVersion:          "v2", // 默认使用v2模板系统
+				EnableProxyProvider:      false,
+				NodeOrder:                []int64{},
+				NodeNameFilter:           "剩余|流量|到期|订阅|时间|重置",
+				AppendSubInfo:            false,
+				ProxyGroupsSourceURL:     systemConfig.ProxyGroupsSourceURL,
+				ClientCompatibilityMode:  systemConfig.ClientCompatibilityMode,
+				SilentMode:               systemConfig.SilentMode,
+				SilentModeTimeout:        systemConfig.SilentModeTimeout,
+				EnableSubInfoNodes:       systemConfig.EnableSubInfoNodes,
+				SubInfoV2RayOnly:         systemConfig.SubInfoV2RayOnly,
+				SubInfoExpirePrefix:      systemConfig.SubInfoExpirePrefix,
+				SubInfoTrafficPrefix:     systemConfig.SubInfoTrafficPrefix,
+				EnableSubTrafficHeader:   systemConfig.EnableSubTrafficHeader,
+				EnableOverrideScripts:    systemConfig.EnableOverrideScripts,
+				SubscriptionOutputFormat: systemConfig.SubscriptionOutputFormat,
+				LoginRateMaxAttempts:     systemConfig.LoginRateMaxAttempts,
+				LoginRateWindow:          systemConfig.LoginRateWindow,
+				LoginRateLockDuration:    systemConfig.LoginRateLockDuration,
+				BruteForceEnabled:        systemConfig.BruteForceEnabled,
+				BruteForceMaxFailures:    systemConfig.BruteForceMaxFailures,
+				BruteForceWindow:         systemConfig.BruteForceWindow,
+				BruteForceBlockDuration:  systemConfig.BruteForceBlockDuration,
+				SubRateLimitEnabled:      systemConfig.SubRateLimitEnabled,
+				SubRateLimitMax:          systemConfig.SubRateLimitMax,
+				SubRateLimitWindow:       systemConfig.SubRateLimitWindow,
+				SkipLocalIP:              systemConfig.SkipLocalIP,
+				BlockUnknownSubUA:        systemConfig.BlockUnknownSubUA,
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -110,96 +179,49 @@ func handleGetUserConfig(w http.ResponseWriter, r *http.Request, repo *storage.T
 		return
 	}
 
-	// NodeOrder 空时:沿用最早 admin 用户的排序,过滤掉当前用户看不见的节点 ID。
-	// 用户首次进节点管理页面就能看到跟管理员一致的顺序,而不是"按 created_at desc 一锅乱"。
-	nodeOrder := settings.NodeOrder
-	if len(nodeOrder) == 0 {
-		nodeOrder = computeFallbackNodeOrder(r.Context(), repo, username)
-	}
-
 	resp := userConfigResponse{
-		ForceSyncExternal:       settings.ForceSyncExternal,
-		MatchRule:               settings.MatchRule,
-		SyncScope:               settings.SyncScope,
-		KeepNodeName:            settings.KeepNodeName,
-		CacheExpireMinutes:      settings.CacheExpireMinutes,
-		SyncTraffic:             settings.SyncTraffic,
-		NodeNameFilter:          settings.NodeNameFilter,
-		AppendSubInfo:           settings.AppendSubInfo,
-		CustomRulesEnabled:      true, // 自定义规则始终启用
-		EnableShortLink:         settings.EnableShortLink,
-		UseNewTemplateSystem:    settings.UseNewTemplateSystem,
-		EnableProxyProvider:     settings.EnableProxyProvider,
-		NodeOrder:               nodeOrder,
-		ProxyGroupsSourceURL:    systemConfig.ProxyGroupsSourceURL,
-		ClientCompatibilityMode: systemConfig.ClientCompatibilityMode,
+		ForceSyncExternal:        settings.ForceSyncExternal,
+		MatchRule:                settings.MatchRule,
+		SyncScope:                settings.SyncScope,
+		KeepNodeName:             settings.KeepNodeName,
+		CacheExpireMinutes:       settings.CacheExpireMinutes,
+		SyncTraffic:              settings.SyncTraffic,
+		EnableProbeBinding:       settings.EnableProbeBinding,
+		CustomRulesEnabled:       true, // 自定义规则始终启用
+		EnableShortLink:          systemConfig.EnableShortLink,
+		TemplateVersion:          settings.TemplateVersion,
+		EnableProxyProvider:      settings.EnableProxyProvider,
+		NodeOrder:                settings.NodeOrder,
+		NodeNameFilter:           settings.NodeNameFilter,
+		AppendSubInfo:            settings.AppendSubInfo,
+		ProxyGroupsSourceURL:     systemConfig.ProxyGroupsSourceURL,
+		ClientCompatibilityMode:  systemConfig.ClientCompatibilityMode,
+		SilentMode:               systemConfig.SilentMode,
+		SilentModeTimeout:        systemConfig.SilentModeTimeout,
+		EnableSubInfoNodes:       systemConfig.EnableSubInfoNodes,
+		SubInfoV2RayOnly:         systemConfig.SubInfoV2RayOnly,
+		SubInfoExpirePrefix:      systemConfig.SubInfoExpirePrefix,
+		SubInfoTrafficPrefix:     systemConfig.SubInfoTrafficPrefix,
+		EnableSubTrafficHeader:   systemConfig.EnableSubTrafficHeader,
+		EnableOverrideScripts:    systemConfig.EnableOverrideScripts,
+		SubscriptionOutputFormat: systemConfig.SubscriptionOutputFormat,
+		LoginRateMaxAttempts:     systemConfig.LoginRateMaxAttempts,
+		LoginRateWindow:          systemConfig.LoginRateWindow,
+		LoginRateLockDuration:    systemConfig.LoginRateLockDuration,
+		BruteForceEnabled:        systemConfig.BruteForceEnabled,
+		BruteForceMaxFailures:    systemConfig.BruteForceMaxFailures,
+		BruteForceWindow:         systemConfig.BruteForceWindow,
+		BruteForceBlockDuration:  systemConfig.BruteForceBlockDuration,
+		SubRateLimitEnabled:      systemConfig.SubRateLimitEnabled,
+		SubRateLimitMax:          systemConfig.SubRateLimitMax,
+		SubRateLimitWindow:       systemConfig.SubRateLimitWindow,
+		SkipLocalIP:              systemConfig.SkipLocalIP,
+		BlockUnknownSubUA:        systemConfig.BlockUnknownSubUA,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
-}
-
-// computeFallbackNodeOrder 返回最早 admin 用户的 NodeOrder 经过"当前 user 可见节点"过滤的结果。
-// 用于普通用户第一次进节点管理 / 未自定义排序时,沿用 admin 已调好的顺序,而不是按 created_at 的杂乱顺序。
-// 返回空数组的情况:用户自己就是 admin / 找不到 admin / admin 自己也没排过 / 没有可见节点。
-func computeFallbackNodeOrder(ctx context.Context, repo *storage.TrafficRepository, username string) []int64 {
-	empty := []int64{}
-	if repo == nil || username == "" {
-		return empty
-	}
-	// 找最早创建的 admin 用户(ListUsers ORDER BY created_at ASC)
-	users, err := repo.ListUsers(ctx, 1000)
-	if err != nil {
-		return empty
-	}
-	var adminUsername string
-	for _, u := range users {
-		if u.Role == storage.RoleAdmin && u.Username != username {
-			adminUsername = u.Username
-			break
-		}
-	}
-	if adminUsername == "" {
-		return empty
-	}
-	// 拿 admin 的 NodeOrder
-	adminSettings, err := repo.GetUserSettings(ctx, adminUsername)
-	if err != nil || len(adminSettings.NodeOrder) == 0 {
-		return empty
-	}
-	// 当前用户可见节点 ID 集合
-	visible := gatherUserVisibleNodeIDs(ctx, repo, username)
-	if len(visible) == 0 {
-		return empty
-	}
-	// 按 admin 顺序过滤
-	filtered := make([]int64, 0, len(adminSettings.NodeOrder))
-	for _, id := range adminSettings.NodeOrder {
-		if visible[id] {
-			filtered = append(filtered, id)
-		}
-	}
-	return filtered
-}
-
-// gatherUserVisibleNodeIDs 返回 user 能在节点管理里看到的所有节点 ID 集合 = 自己导入 + 绑定套餐节点。
-// 跟 nodesHandler.handleList 普通用户分支保持一致;权限收敛点,排序 fallback 也要复用同一口径。
-func gatherUserVisibleNodeIDs(ctx context.Context, repo *storage.TrafficRepository, username string) map[int64]bool {
-	set := make(map[int64]bool)
-	if nodes, err := repo.ListNodes(ctx, username); err == nil {
-		for _, n := range nodes {
-			set[n.ID] = true
-		}
-	}
-	if user, err := repo.GetUser(ctx, username); err == nil && user.PackageID > 0 {
-		if pkg, err := repo.GetPackage(ctx, user.PackageID); err == nil && pkg != nil {
-			for _, nid := range pkg.Nodes {
-				set[nid] = true
-			}
-		}
-	}
-	return set
 }
 
 func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storage.TrafficRepository, username string) {
@@ -209,17 +231,17 @@ func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storag
 		return
 	}
 
-	// 验证匹配规则
+	// Validate match rule
 	matchRule := strings.TrimSpace(payload.MatchRule)
 	if matchRule == "" {
 		matchRule = "node_name"
 	}
-	if matchRule != "node_name" && matchRule != "server_port" && matchRule != "type_server_port" {
-		writeError(w, http.StatusBadRequest, errors.New("match_rule must be 'node_name', 'server_port', or 'type_server_port'"))
+	if matchRule != "node_name" && matchRule != "server_port" && matchRule != "type_server_port" && matchRule != "type_server_port_cred" {
+		writeError(w, http.StatusBadRequest, errors.New("match_rule must be 'node_name', 'server_port', 'type_server_port', or 'type_server_port_cred'"))
 		return
 	}
 
-	// 验证同步范围
+	// Validate sync scope
 	syncScope := strings.TrimSpace(payload.SyncScope)
 	if syncScope == "" {
 		syncScope = "saved_only"
@@ -229,57 +251,44 @@ func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storag
 		return
 	}
 
-	// 验证缓存过期分钟
+	// Validate cache expire minutes
 	cacheExpireMinutes := payload.CacheExpireMinutes
 	if cacheExpireMinutes < 0 {
 		cacheExpireMinutes = 0
 	}
 
-	// 处理use_new_template_system，如果没有提供则默认为true
-	useNewTemplateSystem := true
-	if payload.UseNewTemplateSystem != nil {
-		useNewTemplateSystem = *payload.UseNewTemplateSystem
+	// Handle template_version, default to "v2" if not provided
+	templateVersion := strings.TrimSpace(payload.TemplateVersion)
+	if templateVersion == "" {
+		templateVersion = "v2"
+	}
+	if templateVersion != "v1" && templateVersion != "v2" && templateVersion != "v3" {
+		writeError(w, http.StatusBadRequest, errors.New("template_version must be 'v1', 'v2', or 'v3'"))
+		return
 	}
 
-	// 验证并清理代理组源 URL
+	// Validate and sanitize proxy groups source URL
 	proxyGroupsSourceURL := strings.TrimSpace(payload.ProxyGroupsSourceURL)
 	if err := validateProxyGroupsSourceURL(proxyGroupsSourceURL); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
-	// node_order 用指针区分"未提供"与"显式清空":系统设置页等不管节点顺序的调用不会带 node_order,
-	// payload.NodeOrder==nil 时必须保留已存顺序,否则整行 upsert 会把它清空 → 节点管理页乱序(与旁边
-	// system_config "先读全量再改" 同理)。非 nil(节点管理页拖拽排序)才覆盖。
-	// node_order 与 default_template_filename 都不在本请求体里(或用指针表达"未提供"),
-	// upsert 是整行覆盖,必须先读回已存值带上,否则会被清空。default_template_filename 走独立端点维护。
-	nodeOrder := []int64{}
-	defaultTemplateFilename := ""
-	existing, existingErr := repo.GetUserSettings(r.Context(), username)
-	if existingErr == nil {
-		nodeOrder = existing.NodeOrder
-		defaultTemplateFilename = existing.DefaultTemplateFilename
-	}
-	if payload.NodeOrder != nil {
-		nodeOrder = *payload.NodeOrder
-	}
-
 	settings := storage.UserSettings{
-		Username:                username,
-		ForceSyncExternal:       payload.ForceSyncExternal,
-		MatchRule:               matchRule,
-		SyncScope:               syncScope,
-		KeepNodeName:            payload.KeepNodeName,
-		CacheExpireMinutes:      cacheExpireMinutes,
-		SyncTraffic:             payload.SyncTraffic,
-		NodeNameFilter:          payload.NodeNameFilter,
-		AppendSubInfo:           payload.AppendSubInfo,
-		CustomRulesEnabled:      true, // 自定义规则始终启用
-		EnableShortLink:         payload.EnableShortLink,
-		UseNewTemplateSystem:    useNewTemplateSystem,
-		EnableProxyProvider:     payload.EnableProxyProvider,
-		NodeOrder:               nodeOrder,
-		DefaultTemplateFilename: defaultTemplateFilename,
+		Username:            username,
+		ForceSyncExternal:   payload.ForceSyncExternal,
+		MatchRule:           matchRule,
+		SyncScope:           syncScope,
+		KeepNodeName:        payload.KeepNodeName,
+		CacheExpireMinutes:  cacheExpireMinutes,
+		SyncTraffic:         payload.SyncTraffic,
+		EnableProbeBinding:  payload.EnableProbeBinding,
+		CustomRulesEnabled:  true, // 自定义规则始终启用
+		TemplateVersion:     templateVersion,
+		EnableProxyProvider: payload.EnableProxyProvider,
+		NodeOrder:           payload.NodeOrder,
+		NodeNameFilter:      payload.NodeNameFilter,
+		AppendSubInfo:       payload.AppendSubInfo,
 	}
 
 	if err := repo.UpsertUserSettings(r.Context(), settings); err != nil {
@@ -287,36 +296,171 @@ func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storag
 		return
 	}
 
-	// 只更新 system_config 的这两项。必须先读全量再改,否则 UpdateSystemConfig 会把其它系统设置
-	// (短链接 / 通知 / 各间隔 / 静默模式 / 妙妙屋功能 / 默认模板 …)全部清零 —— 这正是"系统设置概率性重置"的根因。
-	systemConfig, err := repo.GetSystemConfig(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("get system config: %w", err))
+	// [安全] 全局系统配置(限流/防爆破/静默/代理组源等)只有管理员能改。
+	// 这个 /api/user/config 接口任意登录用户可达 —— 若不拦,普通用户就能关掉全站防爆破/登录限流
+	// 再爆破管理员,或把 proxy_groups_source_url 指向内网做 SSRF 跳板。
+	// 对非管理员:把 payload 里的所有系统字段回填成当前 DB 值,下面的写入即成为无副作用的原样回写。
+	callerIsAdmin := false
+	if u, uerr := repo.GetUser(r.Context(), username); uerr == nil && u.Role == storage.RoleAdmin {
+		callerIsAdmin = true
+	}
+	if !callerIsAdmin {
+		cur, _ := repo.GetSystemConfig(r.Context())
+		proxyGroupsSourceURL = cur.ProxyGroupsSourceURL
+		payload.ProxyGroupsSourceURL = cur.ProxyGroupsSourceURL
+		payload.ClientCompatibilityMode = cur.ClientCompatibilityMode
+		payload.SilentMode = cur.SilentMode
+		payload.SilentModeTimeout = cur.SilentModeTimeout
+		payload.EnableSubInfoNodes = cur.EnableSubInfoNodes
+		payload.SubInfoV2RayOnly = cur.SubInfoV2RayOnly
+		payload.SubInfoExpirePrefix = cur.SubInfoExpirePrefix
+		payload.SubInfoTrafficPrefix = cur.SubInfoTrafficPrefix
+		payload.EnableShortLink = cur.EnableShortLink
+		payload.EnableSubTrafficHeader = cur.EnableSubTrafficHeader
+		payload.EnableOverrideScripts = cur.EnableOverrideScripts
+		payload.SubscriptionOutputFormat = cur.SubscriptionOutputFormat
+		payload.LoginRateMaxAttempts = cur.LoginRateMaxAttempts
+		payload.LoginRateWindow = cur.LoginRateWindow
+		payload.LoginRateLockDuration = cur.LoginRateLockDuration
+		payload.BruteForceEnabled = cur.BruteForceEnabled
+		payload.BruteForceMaxFailures = cur.BruteForceMaxFailures
+		payload.BruteForceWindow = cur.BruteForceWindow
+		payload.BruteForceBlockDuration = cur.BruteForceBlockDuration
+		payload.SubRateLimitEnabled = cur.SubRateLimitEnabled
+		payload.SubRateLimitMax = cur.SubRateLimitMax
+		payload.SubRateLimitWindow = cur.SubRateLimitWindow
+		payload.SkipLocalIP = cur.SkipLocalIP
+		payload.BlockUnknownSubUA = cur.BlockUnknownSubUA
+	}
+
+	// Update system config with proxy groups source URL and silent mode
+	silentModeTimeout := payload.SilentModeTimeout
+	if silentModeTimeout <= 0 {
+		silentModeTimeout = 15
+	}
+	subInfoExpirePrefix := payload.SubInfoExpirePrefix
+	if subInfoExpirePrefix == "" {
+		subInfoExpirePrefix = "📅过期时间"
+	}
+	subInfoTrafficPrefix := payload.SubInfoTrafficPrefix
+	if subInfoTrafficPrefix == "" {
+		subInfoTrafficPrefix = "⌛剩余流量"
+	}
+	oldSysCfg, _ := repo.GetSystemConfig(r.Context())
+
+	subscriptionOutputFormat := strings.TrimSpace(payload.SubscriptionOutputFormat)
+	if subscriptionOutputFormat == "" {
+		subscriptionOutputFormat = "yaml"
+	}
+	if subscriptionOutputFormat != "yaml" && subscriptionOutputFormat != "json" {
+		writeError(w, http.StatusBadRequest, errors.New("subscription_output_format must be 'yaml' or 'json'"))
 		return
 	}
+
+	systemConfig := oldSysCfg
 	systemConfig.ProxyGroupsSourceURL = proxyGroupsSourceURL
 	systemConfig.ClientCompatibilityMode = payload.ClientCompatibilityMode
+	systemConfig.SilentMode = payload.SilentMode
+	systemConfig.SilentModeTimeout = silentModeTimeout
+	systemConfig.EnableSubInfoNodes = payload.EnableSubInfoNodes
+	systemConfig.SubInfoV2RayOnly = payload.SubInfoV2RayOnly
+	systemConfig.SubInfoExpirePrefix = subInfoExpirePrefix
+	systemConfig.SubInfoTrafficPrefix = subInfoTrafficPrefix
+	systemConfig.EnableShortLink = payload.EnableShortLink
+	systemConfig.EnableSubTrafficHeader = payload.EnableSubTrafficHeader
+	systemConfig.EnableOverrideScripts = payload.EnableOverrideScripts
+	systemConfig.SubscriptionOutputFormat = subscriptionOutputFormat
+	// 安全配置
+	systemConfig.LoginRateMaxAttempts = payload.LoginRateMaxAttempts
+	systemConfig.LoginRateWindow = payload.LoginRateWindow
+	systemConfig.LoginRateLockDuration = payload.LoginRateLockDuration
+	systemConfig.BruteForceEnabled = payload.BruteForceEnabled
+	systemConfig.BruteForceMaxFailures = payload.BruteForceMaxFailures
+	systemConfig.BruteForceWindow = payload.BruteForceWindow
+	systemConfig.BruteForceBlockDuration = payload.BruteForceBlockDuration
+	systemConfig.SubRateLimitEnabled = payload.SubRateLimitEnabled
+	systemConfig.SubRateLimitMax = payload.SubRateLimitMax
+	systemConfig.SubRateLimitWindow = payload.SubRateLimitWindow
+	systemConfig.SkipLocalIP = payload.SkipLocalIP
+	systemConfig.BlockUnknownSubUA = payload.BlockUnknownSubUA
 	if err := repo.UpdateSystemConfig(r.Context(), systemConfig); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("update system config: %w", err))
 		return
 	}
 
+	// 热更新安全组件配置
+	if rl := GetLoginRateLimiter(); rl != nil {
+		rl.UpdateConfig(systemConfig.LoginRateMaxAttempts, systemConfig.LoginRateWindow, systemConfig.LoginRateLockDuration)
+	}
+	if bfp := GetBruteForceProtector(); bfp != nil {
+		bfp.UpdateConfig(systemConfig.BruteForceEnabled, systemConfig.BruteForceMaxFailures, systemConfig.BruteForceWindow, systemConfig.BruteForceBlockDuration)
+	}
+	if srl := GetSubscriptionRateLimiter(); srl != nil {
+		srl.UpdateConfig(systemConfig.SubRateLimitEnabled, systemConfig.SubRateLimitMax, systemConfig.SubRateLimitWindow)
+	}
+	if rl := GetLoginRateLimiter(); rl != nil {
+		rl.SetSkipLocalIP(systemConfig.SkipLocalIP)
+	}
+	if bfp := GetBruteForceProtector(); bfp != nil {
+		bfp.SetSkipLocalIP(systemConfig.SkipLocalIP)
+	}
+	if srl := GetSubscriptionRateLimiter(); srl != nil {
+		srl.SetSkipLocalIP(systemConfig.SkipLocalIP)
+	}
+	SetBlockUnknownSubscriptionUA(systemConfig.BlockUnknownSubUA)
+
+	if oldSysCfg.SilentMode != payload.SilentMode {
+		if n := GetNotifier(); n != nil {
+			status := "已关闭"
+			if payload.SilentMode {
+				status = "已开启"
+			}
+			go n.Send(context.Background(), notify.Event{
+				Type:    notify.EventSilentMode,
+				Title:   "静默模式变更",
+				Message: fmt.Sprintf("静默模式 %s", status),
+			})
+		}
+	}
+
 	resp := userConfigResponse{
-		ForceSyncExternal:       settings.ForceSyncExternal,
-		MatchRule:               settings.MatchRule,
-		SyncScope:               settings.SyncScope,
-		KeepNodeName:            settings.KeepNodeName,
-		CacheExpireMinutes:      settings.CacheExpireMinutes,
-		SyncTraffic:             settings.SyncTraffic,
-		NodeNameFilter:          settings.NodeNameFilter,
-		AppendSubInfo:           settings.AppendSubInfo,
-		CustomRulesEnabled:      true, // 自定义规则始终启用
-		EnableShortLink:         settings.EnableShortLink,
-		UseNewTemplateSystem:    settings.UseNewTemplateSystem,
-		EnableProxyProvider:     settings.EnableProxyProvider,
-		NodeOrder:               settings.NodeOrder,
-		ProxyGroupsSourceURL:    proxyGroupsSourceURL,
-		ClientCompatibilityMode: payload.ClientCompatibilityMode,
+		ForceSyncExternal:        settings.ForceSyncExternal,
+		MatchRule:                settings.MatchRule,
+		SyncScope:                settings.SyncScope,
+		KeepNodeName:             settings.KeepNodeName,
+		CacheExpireMinutes:       settings.CacheExpireMinutes,
+		SyncTraffic:              settings.SyncTraffic,
+		EnableProbeBinding:       settings.EnableProbeBinding,
+		CustomRulesEnabled:       true, // 自定义规则始终启用
+		EnableShortLink:          payload.EnableShortLink,
+		TemplateVersion:          settings.TemplateVersion,
+		EnableProxyProvider:      settings.EnableProxyProvider,
+		NodeOrder:                settings.NodeOrder,
+		NodeNameFilter:           settings.NodeNameFilter,
+		AppendSubInfo:            settings.AppendSubInfo,
+		ProxyGroupsSourceURL:     proxyGroupsSourceURL,
+		ClientCompatibilityMode:  payload.ClientCompatibilityMode,
+		SilentMode:               payload.SilentMode,
+		SilentModeTimeout:        silentModeTimeout,
+		EnableSubInfoNodes:       payload.EnableSubInfoNodes,
+		SubInfoV2RayOnly:         payload.SubInfoV2RayOnly,
+		SubInfoExpirePrefix:      subInfoExpirePrefix,
+		SubInfoTrafficPrefix:     subInfoTrafficPrefix,
+		EnableSubTrafficHeader:   payload.EnableSubTrafficHeader,
+		EnableOverrideScripts:    payload.EnableOverrideScripts,
+		SubscriptionOutputFormat: subscriptionOutputFormat,
+		LoginRateMaxAttempts:     systemConfig.LoginRateMaxAttempts,
+		LoginRateWindow:          systemConfig.LoginRateWindow,
+		LoginRateLockDuration:    systemConfig.LoginRateLockDuration,
+		BruteForceEnabled:        systemConfig.BruteForceEnabled,
+		BruteForceMaxFailures:    systemConfig.BruteForceMaxFailures,
+		BruteForceWindow:         systemConfig.BruteForceWindow,
+		BruteForceBlockDuration:  systemConfig.BruteForceBlockDuration,
+		SubRateLimitEnabled:      systemConfig.SubRateLimitEnabled,
+		SubRateLimitMax:          systemConfig.SubRateLimitMax,
+		SubRateLimitWindow:       systemConfig.SubRateLimitWindow,
+		SkipLocalIP:              systemConfig.SkipLocalIP,
+		BlockUnknownSubUA:        systemConfig.BlockUnknownSubUA,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -341,4 +485,58 @@ func validateProxyGroupsSourceURL(rawURL string) error {
 	}
 
 	return nil
+}
+
+// computeFallbackNodeOrder 当用户没有自定义节点排序时,回退到 admin 的排序(按可见节点过滤)。
+func computeFallbackNodeOrder(ctx context.Context, repo *storage.TrafficRepository, username string) []int64 {
+	empty := []int64{}
+	if repo == nil || username == "" {
+		return empty
+	}
+	users, err := repo.ListUsers(ctx, 1000)
+	if err != nil {
+		return empty
+	}
+	var adminUsername string
+	for _, u := range users {
+		if u.Role == storage.RoleAdmin && u.Username != username {
+			adminUsername = u.Username
+			break
+		}
+	}
+	if adminUsername == "" {
+		return empty
+	}
+	adminSettings, err := repo.GetUserSettings(ctx, adminUsername)
+	if err != nil || len(adminSettings.NodeOrder) == 0 {
+		return empty
+	}
+	visible := gatherUserVisibleNodeIDs(ctx, repo, username)
+	if len(visible) == 0 {
+		return empty
+	}
+	filtered := make([]int64, 0, len(adminSettings.NodeOrder))
+	for _, id := range adminSettings.NodeOrder {
+		if visible[id] {
+			filtered = append(filtered, id)
+		}
+	}
+	return filtered
+}
+
+func gatherUserVisibleNodeIDs(ctx context.Context, repo *storage.TrafficRepository, username string) map[int64]bool {
+	set := make(map[int64]bool)
+	if nodes, err := repo.ListNodes(ctx, username); err == nil {
+		for _, n := range nodes {
+			set[n.ID] = true
+		}
+	}
+	if user, err := repo.GetUser(ctx, username); err == nil && user.PackageID > 0 {
+		if pkg, err := repo.GetPackage(ctx, user.PackageID); err == nil && pkg != nil {
+			for _, nid := range pkg.Nodes {
+				set[nid] = true
+			}
+		}
+	}
+	return set
 }

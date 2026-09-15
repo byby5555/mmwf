@@ -21,6 +21,16 @@ const (
 	EventCertResult           EventType = "cert_result"           // 证书申请成功/失败
 	EventAgentLongOffline     EventType = "agent_long_offline"    // agent 长期离线(N 分钟无心跳)
 	EventDeviceLimitExceeded  EventType = "device_limit_exceeded" // 用户触发设备数超限(agent 踢最旧)
+
+	// EventNodeProbeOffline/Online 外部节点探测判定的不可用/恢复。
+	EventNodeProbeOffline EventType = "node_probe_offline"
+	EventNodeProbeOnline  EventType = "node_probe_online"
+
+	// EventExpiry 订阅即将到期通知
+	EventExpiry EventType = "expiry"
+
+	// EventSilentMode 静默模式通知
+	EventSilentMode EventType = "silent_mode"
 )
 
 type Config struct {
@@ -51,6 +61,16 @@ type Config struct {
 	// NotifyIPBan：IP 被暴力防护封禁时通知。历史上 EventIPBan 有触发点(brute_force.go)但
 	// CheckEnabled 没有对应 case → 通知永远发不出。补上字段 + case + 配置读写修复它。
 	NotifyIPBan bool
+
+	// NodeProbe 节点探测通知开关
+	NotifyNodeProbeOffline bool
+	NotifyNodeProbeOnline  bool
+
+	// NotifySilentMode 静默模式通知开关
+	NotifySilentMode bool
+
+	// NotifyExpiry 订阅到期通知开关
+	NotifyExpiry bool
 }
 
 type Event struct {

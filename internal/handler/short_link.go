@@ -14,10 +14,10 @@ import (
 type shortLinkHandler struct {
 	repo                *storage.TrafficRepository
 	subscriptionHandler *SubscriptionHandler
-	packageHandler      http.Handler
 }
 
-func NewShortLinkHandler(repo *storage.TrafficRepository, subscriptionHandler *SubscriptionHandler, packageHandler http.Handler) *shortLinkHandler {
+// NewShortLinkHandler creates a handler for short link redirection.
+func NewShortLinkHandler(repo *storage.TrafficRepository, subscriptionHandler *SubscriptionHandler) *shortLinkHandler {
 	if repo == nil {
 		panic("short link handler requires repository")
 	}
@@ -28,7 +28,6 @@ func NewShortLinkHandler(repo *storage.TrafficRepository, subscriptionHandler *S
 	return &shortLinkHandler{
 		repo:                repo,
 		subscriptionHandler: subscriptionHandler,
-		packageHandler:      packageHandler,
 	}
 }
 
@@ -39,76 +38,34 @@ func (h *shortLinkHandler) TryServe(w http.ResponseWriter, r *http.Request) bool
 		return false
 	}
 
-	code := strings.Trim(r.URL.Path, "/")
-	code = strings.TrimPrefix(code, "x/")
-	if len(code) < 2 {
+	compositeCode := strings.Trim(r.URL.Path, "/")
+	if len(compositeCode) < 2 {
 		return false
 	}
 
 	ctx := r.Context()
 
-	// 新逻辑：直接用 code 查 subscribe_files 表（custom_short_code 或 file_short_code）
-	if sf, err := h.repo.GetSubscribeFileByShortCode(ctx, code); err == nil {
-		username := sf.CreatedBy
-		if username == "" {
-			return false
-		}
-
-		if sf.Type == "package" && h.packageHandler != nil {
-			newCtx := auth.ContextWithUsername(ctx, username)
-			h.packageHandler.ServeHTTP(w, r.Clone(newCtx))
-			return true
-		}
-
-		newURL := *r.URL
-		q := newURL.Query()
-		q.Set("filename", sf.Filename)
-		if clientType := r.URL.Query().Get("t"); clientType != "" {
-			q.Set("t", clientType)
-		}
-		newURL.RawQuery = q.Encode()
-
-		newCtx := auth.ContextWithUsername(ctx, username)
-		newRequest := r.Clone(newCtx)
-		newRequest.URL = &newURL
-		h.subscriptionHandler.ServeHTTP(w, newRequest)
-		return true
-	}
-
-	// Fallback: 旧复合码逻辑（FileShortCode + UserShortCode）
 	fileCodes, err := h.repo.GetAllFileShortCodes(ctx)
-	if err != nil {
-		fileCodes = nil
+	if err != nil || len(fileCodes) == 0 {
+		return false
 	}
 	userCodes, err := h.repo.GetAllUserShortCodes(ctx)
 	if err != nil || len(userCodes) == 0 {
 		return false
 	}
-	packageCodes, _ := h.repo.GetAllPackageShortCodes(ctx)
 
-	if len(fileCodes) == 0 && len(packageCodes) == 0 {
-		return false
-	}
-
+	// 因为自定义短链接没有分隔符, 此处使用模糊匹配
+	// TODO: 如果用户体验不佳改为缓存加hash匹配
 	var filename, username string
-	var isPackage bool
 	matched := false
-	for i := len(code) - 1; i >= 1; i-- {
-		leftCode := code[:i]
-		rightCode := code[i:]
-		un, uOk := userCodes[rightCode]
-		if !uOk {
-			continue
-		}
-		if fn, fOk := fileCodes[leftCode]; fOk {
+	for i := len(compositeCode) - 1; i >= 1; i-- {
+		fileCode := compositeCode[:i]
+		userCode := compositeCode[i:]
+		fn, fOk := fileCodes[fileCode]
+		un, uOk := userCodes[userCode]
+		if fOk && uOk {
 			filename = fn
 			username = un
-			matched = true
-			break
-		}
-		if _, pOk := packageCodes[leftCode]; pOk {
-			username = un
-			isPackage = true
 			matched = true
 			break
 		}
@@ -118,13 +75,7 @@ func (h *shortLinkHandler) TryServe(w http.ResponseWriter, r *http.Request) bool
 		return false
 	}
 
-	if isPackage && h.packageHandler != nil {
-		newCtx := auth.ContextWithUsername(ctx, username)
-		newRequest := r.Clone(newCtx)
-		h.packageHandler.ServeHTTP(w, newRequest)
-		return true
-	}
-
+	// 使用真实文件与用户token转发订阅请求
 	newURL := *r.URL
 	q := newURL.Query()
 	q.Set("filename", filename)
@@ -140,16 +91,19 @@ func (h *shortLinkHandler) TryServe(w http.ResponseWriter, r *http.Request) bool
 	return true
 }
 
+// ServeHTTP implements http.Handler for backward compatibility.
 func (h *shortLinkHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !h.TryServe(w, r) {
 		http.NotFound(w, r)
 	}
 }
 
+// NewShortLinkResetHandler creates a handler for resetting short links.
 type shortLinkResetHandler struct {
 	repo *storage.TrafficRepository
 }
 
+// NewShortLinkResetHandler creates a handler for resetting user short links.
 func NewShortLinkResetHandler(repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
 		panic("short link reset handler requires repository")
@@ -159,6 +113,7 @@ func NewShortLinkResetHandler(repo *storage.TrafficRepository) http.Handler {
 }
 
 func (h *shortLinkResetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Get username from context (authenticated via middleware)
 	username := auth.UsernameFromContext(r.Context())
 	if username == "" {
 		writeError(w, http.StatusUnauthorized, errors.New("unauthorized"))
@@ -170,11 +125,21 @@ func (h *shortLinkResetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	h.handleReset(w, r, username)
+}
+
+func (h *shortLinkResetHandler) handleReset(w http.ResponseWriter, r *http.Request, username string) {
+	// Reset short URLs for all subscriptions
 	if err := h.repo.ResetAllSubscriptionShortURLs(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
+	if m := GetSilentModeManager(); m != nil {
+		m.InvalidateShortLinkCache()
+	}
+
+	// Return success
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"message":"所有订阅的短链接已重置"}`)
@@ -189,9 +154,8 @@ func NewUserCustomShortCodeSelfHandler(repo *storage.TrafficRepository) http.Han
 			return
 		}
 
-		// 不向普通用户开放:用户短码现为系统随机生成(3-10 位)不可自定义,
-		// 仅管理员保留设置入口,避免普通用户自定义引发的短码冲突可用性预言机。
-		if !userIsAdmin(r.Context(), repo, username) {
+		// 不向普通用户开放:用户短码现为系统随机生成(3-10 位)不可自定义,仅管理员保留入口。
+		if u, uerr := repo.GetUser(r.Context(), username); uerr != nil || u.Role != storage.RoleAdmin {
 			writeError(w, http.StatusForbidden, errors.New("该功能未开放"))
 			return
 		}
@@ -232,16 +196,19 @@ func NewUserCustomShortCodeSelfHandler(repo *storage.TrafficRepository) http.Han
 				userCodes, err := repo.GetAllUserShortCodes(r.Context())
 				if err == nil {
 					if un, exists := userCodes[code]; exists && un != username {
-						// 不透露被谁占用,避免泄露其他用户的短码(可用性预言机)。
-						writeError(w, http.StatusConflict, errors.New("该短码已被占用，请更换一个"))
+						writeError(w, http.StatusConflict, errors.New("该自定义连接已被其他用户使用"))
 						return
 					}
 				}
 			}
 
 			if err := repo.UpdateUserCustomShortCode(r.Context(), username, code); err != nil {
-				writeError(w, http.StatusConflict, errors.New("该短码已被占用，请更换一个"))
+				writeError(w, http.StatusConflict, errors.New(err.Error()))
 				return
+			}
+
+			if m := GetSilentModeManager(); m != nil {
+				m.InvalidateShortLinkCache()
 			}
 
 			w.Header().Set("Content-Type", "application/json")

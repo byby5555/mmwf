@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/scriptengine"
 	"miaomiaowux/internal/storage"
 )
 
@@ -43,7 +42,18 @@ func NewOverrideScriptsHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 
+		user, err := repo.GetUser(r.Context(), username)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if user.Role != storage.RoleAdmin {
+			writeError(w, http.StatusForbidden, errors.New("admin access required"))
+			return
+		}
+
 		pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		// /api/admin/override-scripts or /api/admin/override-scripts/{id}
 		var idStr string
 		if len(pathParts) >= 4 {
 			idStr = pathParts[3]
@@ -96,19 +106,6 @@ func NewOverrideScriptsHandler(repo *storage.TrafficRepository) http.Handler {
 				return
 			}
 
-			// 语法预校验:保存前用 goja 编译一次,挡住 SyntaxError 进 db
-			// (字符串里夹真实换行 / 缺括号 / typo 等)。挂了订阅生成才报错不友好。
-			if err := scriptengine.Lint(req.Content); err != nil {
-				writeError(w, http.StatusBadRequest, err)
-				return
-			}
-
-			// 配额校验:普通用户创建覆写脚本受全局配额限制(admin 不限)。
-			if qerr := checkUserQuota(r.Context(), repo, username, "override"); qerr != nil {
-				writeError(w, http.StatusForbidden, qerr)
-				return
-			}
-
 			script := &storage.OverrideScript{
 				Username:  username,
 				Name:      req.Name,
@@ -150,14 +147,6 @@ func NewOverrideScriptsHandler(repo *storage.TrafficRepository) http.Handler {
 			if req.Hook != "" && req.Hook != "post_fetch" && req.Hook != "pre_save_nodes" {
 				writeError(w, http.StatusBadRequest, errors.New("hook must be 'post_fetch' or 'pre_save_nodes'"))
 				return
-			}
-
-			// 语法预校验:同 POST,只在 content 非空时校验(允许 PUT 只改 enabled / name / sort_order 等元数据)
-			if req.Content != "" {
-				if err := scriptengine.Lint(req.Content); err != nil {
-					writeError(w, http.StatusBadRequest, err)
-					return
-				}
 			}
 
 			script := &storage.OverrideScript{

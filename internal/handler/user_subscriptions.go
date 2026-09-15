@@ -13,10 +13,10 @@ type userSubscriptionsHandler struct {
 	repo *storage.TrafficRepository
 }
 
-// NewUserSubscriptionsHandler 创建一个用于管理用户订阅分配的处理程序（仅限管理员）。
-// 支持：
-// - GET /api/admin/users/{username}/subscriptions - 获取用户的订阅 ID
-// - PUT /api/admin/users/{username}/subscriptions - 更新用户的订阅
+// NewUserSubscriptionsHandler creates a handler for managing user-subscription assignments (admin only).
+// Supports:
+// - GET /api/admin/users/{username}/subscriptions - get user's subscription IDs
+// - PUT /api/admin/users/{username}/subscriptions - update user's subscriptions
 func NewUserSubscriptionsHandler(repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
 		panic("user subscriptions handler requires repository")
@@ -26,7 +26,7 @@ func NewUserSubscriptionsHandler(repo *storage.TrafficRepository) http.Handler {
 }
 
 func (h *userSubscriptionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 从路径中提取用户名：/api/admin/users/{username}/subscriptions
+	// Extract username from path: /api/admin/users/{username}/subscriptions
 	path := strings.TrimPrefix(r.URL.Path, "/api/admin/users/")
 	parts := strings.Split(path, "/")
 	if len(parts) < 2 || parts[1] != "subscriptions" {

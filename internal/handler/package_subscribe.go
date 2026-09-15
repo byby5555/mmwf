@@ -696,3 +696,20 @@ func buildRoutedProxyForUser(ctx context.Context, repo *storage.TrafficRepositor
 	proxy["name"] = routedNode.NodeName
 	return proxy, true
 }
+
+// isRuleTemplateFile 判断文件名是否为受支持的模板文件。
+func isRuleTemplateFile(name string) bool {
+	return strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml") || strings.HasSuffix(name, ".conf")
+}
+
+// shadowrocketProducerFor 返回 shadowrocket 系列要用的 producer。
+func shadowrocketProducerFor(clientType string) substore.Producer {
+	switch clientType {
+	case "shadowrocket":
+		return substore.NewShadowrocketProducer()
+	case "clash-to-shadowrocket":
+		return substore.NewShadowrocketTemplateProducer()
+	default:
+		return nil
+	}
+}
