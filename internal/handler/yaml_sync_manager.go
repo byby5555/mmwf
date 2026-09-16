@@ -5,23 +5,23 @@ import (
 	"sync"
 )
 
-// YAMLSyncManager 管理对 YAML 订阅文件的并发访问
+// YAMLSyncManager manages concurrent access to YAML subscription files
 type YAMLSyncManager struct {
 	mu           sync.Mutex
 	subscribeDir string
 }
 
-// 创建一个新的 YAML 同步管理器
+// NewYAMLSyncManager creates a new YAML sync manager
 func NewYAMLSyncManager(subscribeDir string) *YAMLSyncManager {
 	return &YAMLSyncManager{
 		subscribeDir: subscribeDir,
 	}
 }
 
-// 通过适当的锁定将节点更新同步到 YAML 文件
+// SyncNode synchronizes a node update to YAML files with proper locking
 func (m *YAMLSyncManager) SyncNode(oldNodeName, newNodeName string, clashConfigJSON string) error {
 	if m.subscribeDir == "" {
-		return nil // 如果未配置订阅目录则无操作
+		return nil // No-op if subscribe directory is not configured
 	}
 
 	m.mu.Lock()
@@ -37,10 +37,10 @@ func (m *YAMLSyncManager) SyncNode(oldNodeName, newNodeName string, clashConfigJ
 	return err
 }
 
-// 通过适当的锁定从 YAML 文件中删除节点
+// DeleteNode deletes a node from YAML files with proper locking
 func (m *YAMLSyncManager) DeleteNode(nodeName string) error {
 	if m.subscribeDir == "" {
-		return nil // 如果未配置订阅目录则无操作
+		return nil // No-op if subscribe directory is not configured
 	}
 
 	m.mu.Lock()
@@ -58,10 +58,10 @@ func (m *YAMLSyncManager) DeleteNode(nodeName string) error {
 	return err
 }
 
-// 单锁高效删除多个节点
+// BatchDeleteNodes efficiently deletes multiple nodes with a single lock
 func (m *YAMLSyncManager) BatchDeleteNodes(nodeNames []string) error {
 	if m.subscribeDir == "" || len(nodeNames) == 0 {
-		return nil // 如果未配置订阅目录或没有要删除的节点，则无操作
+		return nil // No-op if subscribe directory is not configured or no nodes to delete
 	}
 
 	m.mu.Lock()
@@ -73,7 +73,7 @@ func (m *YAMLSyncManager) BatchDeleteNodes(nodeNames []string) error {
 	successCount := 0
 	failCount := 0
 
-	// 在单个锁定操作中删除所有节点
+	// Delete all nodes in a single locked operation
 	for _, nodeName := range nodeNames {
 		affectedFiles, err := deleteNodeFromYAMLFilesWithLog(m.subscribeDir, nodeName)
 		if err != nil {
@@ -110,7 +110,7 @@ type NodeUpdate struct {
 	ClashConfigJSON string
 }
 
-// BatchSyncNodes 使用单个锁有效同步多个节点更新
+// BatchSyncNodes efficiently syncs multiple node updates with a single lock
 // 批量同步多个节点更新，只读写 YAML 文件一次
 func (m *YAMLSyncManager) BatchSyncNodes(updates []NodeUpdate) error {
 	if m.subscribeDir == "" || len(updates) == 0 {

@@ -552,12 +552,12 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		TrafficResetDay:   resetDay,
 		TrafficStatsMode:  trafficStatsMode,
 		TrafficSource:     trafficSource,
-		IPv6Enabled:       req.IPv6Enabled == nil || *req.IPv6Enabled, // 默认启用;仅显式 false 才关闭
+		Ipv6Enabled:       req.IPv6Enabled == nil || *req.IPv6Enabled, // 默认启用;仅显式 false 才关闭
 		DDNSEnabled:       req.DDNSEnabled,
-		DDNSProviderID:    req.DDNSProviderID,
+		DDNSProviderID:    int(req.DDNSProviderID),
 	}
 
-	if err := h.repo.CreateRemoteServer(ctx, server); err != nil {
+	if _, err := h.repo.CreateRemoteServer(ctx, server); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(RemoteServerResponse{
 			Success: false,

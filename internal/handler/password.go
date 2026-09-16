@@ -49,7 +49,7 @@ func NewPasswordHandler(manager *auth.Manager) http.Handler {
 			return
 		}
 
-		// 使用当前密码进行身份验证并更新为新密码
+		// Authenticate with current password and update to new password
 		if err := manager.ChangePassword(r.Context(), username, current, newPassword); err != nil {
 			writeError(w, http.StatusBadRequest, errors.New("current password is incorrect or update failed"))
 			return

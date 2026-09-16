@@ -25,6 +25,20 @@ func scanNodeTags(node *Node, tagsJSON string) {
 	}
 }
 
+func scanRelayGroupNodeIDs(node *Node, idsJSON string) {
+	if idsJSON != "" && idsJSON != "[]" {
+		_ = json.Unmarshal([]byte(idsJSON), &node.RelayGroupNodeIDs)
+	}
+}
+
+func serializeRelayGroupNodeIDs(ids []int64) string {
+	if len(ids) == 0 {
+		return "[]"
+	}
+	b, _ := json.Marshal(ids)
+	return string(b)
+}
+
 // serializeNodeTags returns JSON string for tags and syncs Tag/Tags fields.
 func serializeNodeTags(node *Node) string {
 	if len(node.Tags) == 0 && node.Tag != "" {
@@ -1257,4 +1271,37 @@ func (r *TrafficRepository) DeleteRoutedNode(ctx context.Context, id int64) erro
 	}
 	_, err := r.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ? AND node_type = 'routed'`, id)
 	return err
+}
+
+// UpdateNodeProbeServer updates the probe server binding for a node.
+func (r *TrafficRepository) UpdateNodeProbeServer(ctx context.Context, nodeID int64, username, probeServer string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+
+	if nodeID <= 0 {
+		return errors.New("node id is required")
+	}
+
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("username is required")
+	}
+
+	probeServer = strings.TrimSpace(probeServer)
+
+	res, err := r.db.ExecContext(ctx, `UPDATE nodes SET probe_server = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND username = ?`, probeServer, nodeID, username)
+	if err != nil {
+		return fmt.Errorf("update node probe server: %w", err)
+	}
+
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("node probe server update rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNodeNotFound
+	}
+
+	return nil
 }

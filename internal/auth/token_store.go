@@ -130,6 +130,22 @@ func (s *TokenStore) RevokeAll() {
 	s.mu.Unlock()
 }
 
+// RevokeByUsername 删除某个用户的全部内存会话。用于停用/删除用户时立即断开其登录态
+// —— 否则(RequireToken 只查内存、不复查用户是否仍存在/启用)该用户的 token 会一直有效到过期。
+func (s *TokenStore) RevokeByUsername(username string) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return
+	}
+	s.mu.Lock()
+	for token, sess := range s.tokens {
+		if sess.username == username {
+			delete(s.tokens, token)
+		}
+	}
+	s.mu.Unlock()
+}
+
 // 将会话添加到内存存储中。用于在启动时从数据库恢复会话。
 func (s *TokenStore) LoadSession(token, username string, expiry time.Time) {
 	token = strings.TrimSpace(token)

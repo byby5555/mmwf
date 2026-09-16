@@ -15,23 +15,23 @@ import (
 	"miaomiaowux/internal/traffic"
 )
 
-type SystemSettingsHandler struct {
+type SystemSettingsAdminHandler struct {
 	repo      *storage.TrafficRepository
 	crypto    *CryptoConfig
 	collector *traffic.Collector // 可选,SetIntervals 时调 hot-reload ticker;nil 时仅落库
 	wsHandler *RemoteWSHandler   // 可选,SetDashboardRefresh 后广播 config_update 给所有 WS-mode agent
 }
 
-func NewSystemSettingsHandler(repo *storage.TrafficRepository, crypto *CryptoConfig) *SystemSettingsHandler {
-	return &SystemSettingsHandler{repo: repo, crypto: crypto}
+func NewSystemSettingsAdminHandler(repo *storage.TrafficRepository, crypto *CryptoConfig) *SystemSettingsAdminHandler {
+	return &SystemSettingsAdminHandler{repo: repo, crypto: crypto}
 }
 
 // SetCollector 注入 traffic.Collector 让 SetIntervals 修改间隔后立即热重载 ticker。
 // main.go 在创建 collector 之后调用一次。
-func (h *SystemSettingsHandler) SetCollector(c *traffic.Collector) { h.collector = c }
+func (h *SystemSettingsAdminHandler) SetCollector(c *traffic.Collector) { h.collector = c }
 
 // SetWSHandler 注入 WS handler 让 SetDashboardRefresh 后向所有 agent 广播 config_update。
-func (h *SystemSettingsHandler) SetWSHandler(ws *RemoteWSHandler) { h.wsHandler = ws }
+func (h *SystemSettingsAdminHandler) SetWSHandler(ws *RemoteWSHandler) { h.wsHandler = ws }
 
 type GetAPITokenResponse struct {
 	Success bool   `json:"success"`
@@ -40,7 +40,7 @@ type GetAPITokenResponse struct {
 }
 
 // 返回当前的 API token
-func (h *SystemSettingsHandler) GetAPIToken(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetAPIToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		return
@@ -65,7 +65,7 @@ func (h *SystemSettingsHandler) GetAPIToken(w http.ResponseWriter, r *http.Reque
 }
 
 // 生成新的 API token
-func (h *SystemSettingsHandler) RegenerateAPIToken(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) RegenerateAPIToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		return
@@ -91,7 +91,7 @@ func (h *SystemSettingsHandler) RegenerateAPIToken(w http.ResponseWriter, r *htt
 }
 
 // 获取主服务器地址
-func (h *SystemSettingsHandler) GetMasterURL(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetMasterURL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		return
@@ -110,7 +110,7 @@ func (h *SystemSettingsHandler) GetMasterURL(w http.ResponseWriter, r *http.Requ
 }
 
 // 设置主服务器地址
-func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetMasterURL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		return
@@ -138,7 +138,7 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 }
 
 // 获取「外部已配 HTTPS/反代」开关(用户自建反代、外部终结 TLS 时置 1,证书页据此不再提示开启 HTTPS)
-func (h *SystemSettingsHandler) GetExternalHTTPS(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetExternalHTTPS(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		return
@@ -149,7 +149,7 @@ func (h *SystemSettingsHandler) GetExternalHTTPS(w http.ResponseWriter, r *http.
 }
 
 // 设置「外部已配 HTTPS/反代」开关
-func (h *SystemSettingsHandler) SetExternalHTTPS(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetExternalHTTPS(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		return
@@ -208,7 +208,7 @@ const (
 )
 
 // GetProbeDisguise 返回伪装探针配置(管理端)。
-func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetProbeDisguise(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		return
@@ -273,7 +273,7 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 }
 
 // SetProbeDisguise 写入伪装探针配置(管理端)。
-func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetProbeDisguise(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		return
@@ -504,7 +504,7 @@ const defaultRedeemTemplate = `使用教程
 {主控域名}`
 
 // GetRedeemTemplate 返回兑换码复制文案模板;未配置时返回内置默认模板。
-func (h *SystemSettingsHandler) GetRedeemTemplate(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetRedeemTemplate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		return
@@ -524,7 +524,7 @@ func (h *SystemSettingsHandler) GetRedeemTemplate(w http.ResponseWriter, r *http
 }
 
 // SetRedeemTemplate 保存兑换码复制文案模板(多行文本)。
-func (h *SystemSettingsHandler) SetRedeemTemplate(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetRedeemTemplate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		return
@@ -548,7 +548,7 @@ func (h *SystemSettingsHandler) SetRedeemTemplate(w http.ResponseWriter, r *http
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "兑换码文案已更新"})
 }
 
-func (h *SystemSettingsHandler) GetShortLinkEnabled(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetShortLinkEnabled(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.repo.GetSystemConfig(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -560,7 +560,7 @@ func (h *SystemSettingsHandler) GetShortLinkEnabled(w http.ResponseWriter, r *ht
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "enable_short_link": cfg.EnableShortLink})
 }
 
-func (h *SystemSettingsHandler) SetShortLinkEnabled(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetShortLinkEnabled(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		EnableShortLink bool `json:"enable_short_link"`
 	}
@@ -595,7 +595,7 @@ const dashboardRefreshKey = "dashboard_refresh_interval_ms"
 const dashboardRefreshDefault = 5000
 
 // GetPublicIntervals 给所有登录用户(包括普通用户),返回前端 dashboard 应用的轮询间隔(ms)。
-func (h *SystemSettingsHandler) GetPublicIntervals(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetPublicIntervals(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -616,7 +616,7 @@ func (h *SystemSettingsHandler) GetPublicIntervals(w http.ResponseWriter, r *htt
 
 // SetDashboardRefresh admin-only,设置前端 dashboard 轮询间隔(ms)。生效:下次前端拉到该值。
 // clamp 到 [1000, 60000] 范围,默认 5000。
-func (h *SystemSettingsHandler) SetDashboardRefresh(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetDashboardRefresh(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -658,7 +658,7 @@ func (h *SystemSettingsHandler) SetDashboardRefresh(w http.ResponseWriter, r *ht
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "refetch_interval_ms": req.RefetchIntervalMs})
 }
 
-func (h *SystemSettingsHandler) GetIntervals(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetIntervals(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.repo.GetSystemConfig(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -685,7 +685,7 @@ func (h *SystemSettingsHandler) GetIntervals(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-func (h *SystemSettingsHandler) SetIntervals(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetIntervals(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SpeedCollectInterval   int `json:"speed_collect_interval"`
 		TrafficCollectInterval int `json:"traffic_collect_interval"`
@@ -770,7 +770,7 @@ func (h *SystemSettingsHandler) SetIntervals(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-func (h *SystemSettingsHandler) GetAgentLogEnabled(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetAgentLogEnabled(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.repo.GetSystemConfig(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -782,7 +782,7 @@ func (h *SystemSettingsHandler) GetAgentLogEnabled(w http.ResponseWriter, r *htt
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "agent_log_enabled": cfg.AgentLogEnabled})
 }
 
-func (h *SystemSettingsHandler) SetAgentLogEnabled(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetAgentLogEnabled(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AgentLogEnabled bool `json:"agent_log_enabled"`
 	}
@@ -819,7 +819,7 @@ func (h *SystemSettingsHandler) SetAgentLogEnabled(w http.ResponseWriter, r *htt
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "Agent日志设置已更新"})
 }
 
-func (h *SystemSettingsHandler) GetOverrideScriptsEnabled(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetOverrideScriptsEnabled(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.repo.GetSystemConfig(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -831,7 +831,7 @@ func (h *SystemSettingsHandler) GetOverrideScriptsEnabled(w http.ResponseWriter,
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "enable_override_scripts": cfg.EnableOverrideScripts})
 }
 
-func (h *SystemSettingsHandler) SetOverrideScriptsEnabled(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetOverrideScriptsEnabled(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		EnableOverrideScripts bool `json:"enable_override_scripts"`
 	}
@@ -860,7 +860,7 @@ func (h *SystemSettingsHandler) SetOverrideScriptsEnabled(w http.ResponseWriter,
 }
 
 // GetSubscriptionOutputFormat / SetSubscriptionOutputFormat — Clash 订阅序列化格式 yaml/json 切换
-func (h *SystemSettingsHandler) GetSubscriptionOutputFormat(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetSubscriptionOutputFormat(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.repo.GetSystemConfig(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -876,7 +876,7 @@ func (h *SystemSettingsHandler) GetSubscriptionOutputFormat(w http.ResponseWrite
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "subscription_output_format": format})
 }
 
-func (h *SystemSettingsHandler) SetSubscriptionOutputFormat(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetSubscriptionOutputFormat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SubscriptionOutputFormat string `json:"subscription_output_format"`
 	}
@@ -915,7 +915,7 @@ func (h *SystemSettingsHandler) SetSubscriptionOutputFormat(w http.ResponseWrite
 // 无 mmw-theme-style cookie 的用户首屏用它决定初始主题(由 web.SetDefaultTheme 注入 index.html)。
 const DefaultThemeKey = "default_theme"
 
-func (h *SystemSettingsHandler) GetDefaultTheme(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetDefaultTheme(w http.ResponseWriter, r *http.Request) {
 	value, _ := h.repo.GetSystemSetting(r.Context(), DefaultThemeKey)
 	if value != "flat" && value != "pixel" && value != "anime" {
 		value = "pixel"
@@ -924,7 +924,7 @@ func (h *SystemSettingsHandler) GetDefaultTheme(w http.ResponseWriter, r *http.R
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "default_theme": value})
 }
 
-func (h *SystemSettingsHandler) SetDefaultTheme(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetDefaultTheme(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DefaultTheme string `json:"default_theme"`
 	}
@@ -953,13 +953,13 @@ func (h *SystemSettingsHandler) SetDefaultTheme(w http.ResponseWriter, r *http.R
 // LoginWallpaperKey 是「自定义登录页壁纸」的 KV 键(存图片 URL,可为空)。
 const LoginWallpaperKey = "login_wallpaper"
 
-func (h *SystemSettingsHandler) GetLoginWallpaper(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetLoginWallpaper(w http.ResponseWriter, r *http.Request) {
 	value, _ := h.repo.GetSystemSetting(r.Context(), LoginWallpaperKey)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "login_wallpaper": value})
 }
 
-func (h *SystemSettingsHandler) SetLoginWallpaper(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetLoginWallpaper(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		LoginWallpaper string `json:"login_wallpaper"`
 	}
@@ -987,13 +987,13 @@ func (h *SystemSettingsHandler) SetLoginWallpaper(w http.ResponseWriter, r *http
 }
 
 // GetLoginWallpaperPublic 公开读取(登录页未鉴权时用)。
-func (h *SystemSettingsHandler) GetLoginWallpaperPublic(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetLoginWallpaperPublic(w http.ResponseWriter, r *http.Request) {
 	value, _ := h.repo.GetSystemSetting(r.Context(), LoginWallpaperKey)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"login_wallpaper": value})
 }
 
-func (h *SystemSettingsHandler) GetSilentMode(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetSilentMode(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.repo.GetSystemConfig(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1009,7 +1009,7 @@ func (h *SystemSettingsHandler) GetSilentMode(w http.ResponseWriter, r *http.Req
 	})
 }
 
-func (h *SystemSettingsHandler) SetSilentMode(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetSilentMode(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SilentMode        bool `json:"silent_mode"`
 		SilentModeTimeout int  `json:"silent_mode_timeout"`
@@ -1042,14 +1042,14 @@ func (h *SystemSettingsHandler) SetSilentMode(w http.ResponseWriter, r *http.Req
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "静默模式设置已更新"})
 }
 
-func (h *SystemSettingsHandler) GetRequireEncryption(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetRequireEncryption(w http.ResponseWriter, r *http.Request) {
 	value, _ := h.repo.GetSystemSetting(r.Context(), "require_encryption")
 	enabled := value == "true"
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "require_encryption": enabled})
 }
 
-func (h *SystemSettingsHandler) SetRequireEncryption(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetRequireEncryption(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		RequireEncryption bool `json:"require_encryption"`
 	}
@@ -1079,7 +1079,7 @@ func (h *SystemSettingsHandler) SetRequireEncryption(w http.ResponseWriter, r *h
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "加密设置已更新"})
 }
 
-func (h *SystemSettingsHandler) GetMiaomiaowuFeaturesEnabled(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetMiaomiaowuFeaturesEnabled(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.repo.GetSystemConfig(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1091,7 +1091,7 @@ func (h *SystemSettingsHandler) GetMiaomiaowuFeaturesEnabled(w http.ResponseWrit
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "enable_miaomiaowu_features": cfg.EnableMiaomiaowuFeatures})
 }
 
-func (h *SystemSettingsHandler) SetMiaomiaowuFeaturesEnabled(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetMiaomiaowuFeaturesEnabled(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		EnableMiaomiaowuFeatures bool `json:"enable_miaomiaowu_features"`
 	}
@@ -1119,7 +1119,7 @@ func (h *SystemSettingsHandler) SetMiaomiaowuFeaturesEnabled(w http.ResponseWrit
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "妙妙屋功能设置已更新"})
 }
 
-func (h *SystemSettingsHandler) GetDefaultTemplate(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetDefaultTemplate(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.repo.GetSystemConfig(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1135,7 +1135,7 @@ func (h *SystemSettingsHandler) GetDefaultTemplate(w http.ResponseWriter, r *htt
 	})
 }
 
-func (h *SystemSettingsHandler) SetDefaultTemplate(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetDefaultTemplate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DefaultTemplateFilename      *string `json:"default_template_filename"`
 		DefaultSurgeTemplateFilename *string `json:"default_surge_template_filename"`
@@ -1193,7 +1193,7 @@ func (h *SystemSettingsHandler) SetDefaultTemplate(w http.ResponseWriter, r *htt
 
 // 节点名称倍率前缀:开关 + 左右分隔符。
 // 开启后订阅生成时,套餐内 multiplier != 1 的节点 name 前面会拼上 "{left}{mult}{right}"。
-func (h *SystemSettingsHandler) GetNodeNameMultiplierPrefix(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) GetNodeNameMultiplierPrefix(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.repo.GetSystemConfig(r.Context())
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1210,7 +1210,7 @@ func (h *SystemSettingsHandler) GetNodeNameMultiplierPrefix(w http.ResponseWrite
 	})
 }
 
-func (h *SystemSettingsHandler) SetNodeNameMultiplierPrefix(w http.ResponseWriter, r *http.Request) {
+func (h *SystemSettingsAdminHandler) SetNodeNameMultiplierPrefix(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Enabled bool   `json:"enabled"`
 		Left    string `json:"left"`

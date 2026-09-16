@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -1620,4 +1621,84 @@ func matchCredential(a, b map[string]interface{}, protocol string) bool {
 		return fmt.Sprint(a["user"]) == fmt.Sprint(b["user"])
 	}
 	return false
+}
+
+// NewPackagesHandler 是一个 RESTful 适配器，将 /api/admin/packages[/{id}] 路由
+// 分发到对应的 mmwf 原有 handler。仅支持 repo 参数（无 remoteManage/limiterPusher），
+// create/update/delete 操作只做 DB 层操作，不下发到 agent。
+func NewPackagesHandler(repo *storage.TrafficRepository) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/api/admin/packages")
+		path = strings.Trim(path, "/")
+		segments := strings.Split(path, "/")
+
+		switch {
+		case len(segments) == 1 && segments[0] == "":
+			// /api/admin/packages
+			switch r.Method {
+			case http.MethodGet:
+			 pkgs, err := repo.ListPackages(r.Context())
+				if err != nil {
+					respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+					return
+				}
+				respondJSON(w, http.StatusOK, pkgs)
+			case http.MethodPost:
+				var pkg storage.Package
+				if err := json.NewDecoder(r.Body).Decode(&pkg); err != nil {
+					respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body"})
+					return
+				}
+				if _, err := repo.CreatePackage(r.Context(), pkg); err != nil {
+					respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+					return
+				}
+				respondJSON(w, http.StatusCreated, pkg)
+			default:
+				methodNotAllowed(w, http.MethodGet, http.MethodPost)
+			}
+		case len(segments) >= 1 && segments[0] != "":
+			id, err := strconv.ParseInt(segments[0], 10, 64)
+			if err != nil {
+				respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid package id"})
+				return
+			}
+			switch {
+			case len(segments) == 1 && r.Method == http.MethodGet:
+				pkg, err := repo.GetPackage(r.Context(), id)
+				if err != nil {
+					if errors.Is(err, storage.ErrPackageNotFound) {
+						http.NotFound(w, r)
+						return
+					}
+					respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+					return
+				}
+				respondJSON(w, http.StatusOK, pkg)
+			case len(segments) == 1 && r.Method == http.MethodPut:
+				var pkg storage.Package
+				if err := json.NewDecoder(r.Body).Decode(&pkg); err != nil {
+					respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid body"})
+					return
+				}
+				pkg.ID = id
+				if err := repo.UpdatePackage(r.Context(), pkg); err != nil {
+					respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+					return
+				}
+				updated, _ := repo.GetPackage(r.Context(), id)
+				respondJSON(w, http.StatusOK, updated)
+			case len(segments) == 1 && r.Method == http.MethodDelete:
+				if err := repo.DeletePackage(r.Context(), id); err != nil {
+					respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+					return
+				}
+				respondJSON(w, http.StatusOK, map[string]bool{"deleted": true})
+			default:
+				methodNotAllowed(w, http.MethodGet, http.MethodPut, http.MethodDelete)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	})
 }

@@ -17,10 +17,10 @@ var globalSilentModeManager *SilentModeManager
 type SilentModeManager struct {
 	repo                 *storage.TrafficRepository
 	tokens               *auth.TokenStore
-	lastActiveTime       sync.Map
-	lastGlobalActiveTime time.Time
-	globalActiveMu       sync.Mutex
-	startTime            time.Time
+	lastActiveTime       sync.Map   // username -> time.Time
+	lastGlobalActiveTime time.Time  // 全局活跃时间，任何用户获取订阅后更新
+	globalActiveMu       sync.Mutex // 保护 lastGlobalActiveTime
+	startTime            time.Time  // 服务启动时间，用于启动后临时恢复
 	shortLinkSet         map[string]struct{}
 	shortLinkSetMu       sync.RWMutex
 	shortLinkSetTime     time.Time
@@ -43,6 +43,7 @@ func GetSilentModeManager() *SilentModeManager {
 	return globalSilentModeManager
 }
 
+// InvalidateShortLinkCache 使短链接缓存失效，下次请求时重新加载
 func (m *SilentModeManager) InvalidateShortLinkCache() {
 	m.shortLinkSetMu.Lock()
 	m.shortLinkSetTime = time.Time{}
@@ -92,6 +93,18 @@ func (m *SilentModeManager) isKnownShortLink(path string) bool {
 	return ok
 }
 
+func (m *SilentModeManager) RecordSubscriptionAccess(username string) {
+	if username == "" {
+		return
+	}
+	m.lastActiveTime.Store(username, time.Now())
+	logger.Info("🔓 [SILENT_MODE] 用户获取订阅，恢复访问权限",
+		"username", username,
+		"time", time.Now().Format("2006-01-02 15:04:05"),
+	)
+}
+
+// RecordSubscriptionAccessWithIP records subscription access and enables global access for all IPs
 func (m *SilentModeManager) RecordSubscriptionAccessWithIP(username, ip string) {
 	if username == "" {
 		return
@@ -99,14 +112,15 @@ func (m *SilentModeManager) RecordSubscriptionAccessWithIP(username, ip string) 
 	now := time.Now()
 	m.lastActiveTime.Store(username, now)
 
+	// 更新全局活跃时间，允许所有IP访问
 	m.globalActiveMu.Lock()
 	m.lastGlobalActiveTime = now
 	m.globalActiveMu.Unlock()
 
-	// 不手动传 "time" —— slog 已自动加 time= 字段,重复会让一行出现两个 time=,污染日志解析。
 	logger.Info("🔓 [SILENT_MODE] 用户获取订阅，恢复所有IP访问权限",
 		"username", username,
 		"ip", ip,
+		"time", now.Format("2006-01-02 15:04:05"),
 	)
 }
 
@@ -125,6 +139,7 @@ func (m *SilentModeManager) isUserActive(username string, timeout int) bool {
 	return time.Now().Before(activeUntil)
 }
 
+// isGlobalActive checks if any user has fetched subscription recently (allows all IPs)
 func (m *SilentModeManager) isGlobalActive(timeout int) bool {
 	m.globalActiveMu.Lock()
 	lastActive := m.lastGlobalActiveTime
@@ -138,6 +153,7 @@ func (m *SilentModeManager) isGlobalActive(timeout int) bool {
 	return time.Now().Before(activeUntil)
 }
 
+// contoken获取用户名
 func (m *SilentModeManager) extractUsername(r *http.Request) string {
 	if m.tokens == nil {
 		return ""
@@ -159,10 +175,11 @@ func (m *SilentModeManager) extractUsername(r *http.Request) string {
 }
 
 func (m *SilentModeManager) isAllowedPath(path string) bool {
+	// 订阅相关接口始终可访问
 	allowedPrefixes := []string{
 		"/api/clash/subscribe",
 		"/api/proxy-provider/",
-		"/t/",
+		"/t/", // 临时订阅
 	}
 
 	for _, prefix := range allowedPrefixes {
@@ -171,6 +188,7 @@ func (m *SilentModeManager) isAllowedPath(path string) bool {
 		}
 	}
 
+	// 短链接：精确匹配已知的短链接组合
 	trimmedPath := strings.Trim(path, "/")
 	if m.isKnownShortLink(trimmedPath) {
 		return true
@@ -201,6 +219,7 @@ func (m *SilentModeManager) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// 服务启动后的恢复期内，允许所有请求
 		recoveryUntil := m.startTime.Add(time.Duration(cfg.SilentModeTimeout) * time.Minute)
 		if time.Now().Before(recoveryUntil) {
 			next.ServeHTTP(w, r)
@@ -215,11 +234,13 @@ func (m *SilentModeManager) Middleware(next http.Handler) http.Handler {
 		username := m.extractUsername(r)
 		clientIP := GetClientIP(r)
 
+		// 检查用户是否在活跃期内（通过 token 识别）
 		if username != "" && m.isUserActive(username, cfg.SilentModeTimeout) {
 			next.ServeHTTP(w, r)
 			return
 		}
 
+		// 检查是否有用户获取过订阅（允许所有IP访问）
 		if m.isGlobalActive(cfg.SilentModeTimeout) {
 			next.ServeHTTP(w, r)
 			return

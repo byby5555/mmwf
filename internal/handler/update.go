@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -19,11 +20,11 @@ import (
 )
 
 const (
-	githubRepo   = "iluobei/miaomiaowuX"
+	githubRepo   = "iluobei/miaomiaowu"
 	githubAPIURL = "https://api.github.com/repos/%s/releases/latest"
 )
 
-// UpdateInfo包含版本更新信息
+// UpdateInfo contains version update information
 type UpdateInfo struct {
 	CurrentVersion string `json:"current_version"`
 	LatestVersion  string `json:"latest_version"`
@@ -33,14 +34,14 @@ type UpdateInfo struct {
 	ReleaseNotes   string `json:"release_notes"`
 }
 
-// UpdateProgress 表示更新操作的进度
+// UpdateProgress represents the progress of an update operation
 type UpdateProgress struct {
-	Step     string `json:"step"`     // 检查、下载、备份、替换、重新启动、完成、错误
-	Progress int    `json:"progress"` // 下载步数 0-100
+	Step     string `json:"step"`     // checking, downloading, backing_up, replacing, restarting, done, error
+	Progress int    `json:"progress"` // 0-100 for downloading step
 	Message  string `json:"message"`
 }
 
-// GitHubRelease 表示版本的 GitHub API 响应
+// GitHubRelease represents the GitHub API response for a release
 type GitHubRelease struct {
 	TagName string `json:"tag_name"`
 	HTMLURL string `json:"html_url"`
@@ -51,7 +52,7 @@ type GitHubRelease struct {
 	} `json:"assets"`
 }
 
-// 返回一个检查更新的处理程序
+// NewUpdateCheckHandler returns a handler that checks for updates
 func NewUpdateCheckHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -71,7 +72,7 @@ func NewUpdateCheckHandler() http.Handler {
 	})
 }
 
-// 返回应用更新的处理程序
+// NewUpdateApplyHandler returns a handler that applies updates
 func NewUpdateApplyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -79,7 +80,7 @@ func NewUpdateApplyHandler() http.Handler {
 			return
 		}
 
-		// 1.获取最新版本信息
+		// 1. Get latest version info
 		info, err := checkLatestVersion()
 		if err != nil {
 			writeUpdateError(w, http.StatusInternalServerError, fmt.Errorf("检查更新失败: %w", err))
@@ -96,7 +97,7 @@ func NewUpdateApplyHandler() http.Handler {
 			return
 		}
 
-		// 2. 将新的二进制文件下载到临时文件
+		// 2. Download new binary to temp file
 		logger.Info("[系统更新] 开始下载更新", "url", info.DownloadURL)
 		tempFile, err := downloadBinary(info.DownloadURL)
 		if err != nil {
@@ -105,29 +106,26 @@ func NewUpdateApplyHandler() http.Handler {
 		}
 		defer os.Remove(tempFile)
 
-		// 3. 获取二进制文件的目标路径
+		// 3. Get target path for the binary
 		targetPath, err := getUpdateTargetPath()
 		if err != nil {
 			writeUpdateError(w, http.StatusInternalServerError, fmt.Errorf("获取程序路径失败: %w", err))
 			return
 		}
 
-		// 4. 备份当前版本（仅适用于非Docker）
-		if !isDocker() {
-			backupPath := targetPath + ".bak"
-			if err := copyFile(targetPath, backupPath); err != nil {
-				logger.Warn("[系统更新] 备份当前版本失败（非致命错误）", "error", err)
-			}
+		// 4. Backup current version
+		if err := backupBinary(targetPath); err != nil {
+			logger.Warn("[系统更新] 备份当前版本失败（非致命错误）", "error", err)
 		}
 
-		// 5. 替换二进制文件
+		// 5. Replace binary
 		logger.Info("[系统更新] 正在替换二进制文件", "from", tempFile, "to", targetPath)
 		if err := replaceBinary(tempFile, targetPath); err != nil {
 			writeUpdateError(w, http.StatusInternalServerError, fmt.Errorf("替换失败: %w", err))
 			return
 		}
 
-		// 6.设置执行权限
+		// 6. Set execute permission
 		if err := os.Chmod(targetPath, 0755); err != nil {
 			writeUpdateError(w, http.StatusInternalServerError, fmt.Errorf("设置权限失败: %w", err))
 			return
@@ -135,7 +133,7 @@ func NewUpdateApplyHandler() http.Handler {
 
 		logger.Info("[系统更新] 更新成功，准备重启服务器")
 
-		// 7.返回成功响应
+		// 7. Return success response
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -143,7 +141,7 @@ func NewUpdateApplyHandler() http.Handler {
 			"message": "更新完成，正在重启...",
 		})
 
-		// 8.异步重启（给客户端时间接收响应）
+		// 8. Restart asynchronously (give client time to receive response)
 		go func() {
 			time.Sleep(500 * time.Millisecond)
 			restartSelf(targetPath)
@@ -151,14 +149,14 @@ func NewUpdateApplyHandler() http.Handler {
 	})
 }
 
-// 返回一个处理程序，该处理程序根据 SSE 进度应用更新
+// NewUpdateApplySSEHandler returns a handler that applies updates with SSE progress
 func NewUpdateApplySSEHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 设置 SSE 标头
+		// Set SSE headers
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no") // 禁用 nginx 缓冲
+		w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
 
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -166,7 +164,7 @@ func NewUpdateApplySSEHandler() http.Handler {
 			return
 		}
 
-		// 发送进度的助手
+		// Helper to send progress
 		sendProgress := func(step string, progress int, message string) {
 			p := UpdateProgress{Step: step, Progress: progress, Message: message}
 			data, _ := json.Marshal(p)
@@ -174,10 +172,8 @@ func NewUpdateApplySSEHandler() http.Handler {
 			flusher.Flush()
 		}
 
-		// 1.检查版本
+		// 1. Check version
 		sendProgress("checking", 0, "正在检查版本信息...")
-
-		force := r.URL.Query().Get("force") == "true"
 
 		info, err := checkLatestVersion()
 		if err != nil {
@@ -185,7 +181,7 @@ func NewUpdateApplySSEHandler() http.Handler {
 			return
 		}
 
-		if !info.HasUpdate && !force {
+		if !info.HasUpdate {
 			sendProgress("error", 0, "已是最新版本")
 			return
 		}
@@ -195,14 +191,14 @@ func NewUpdateApplySSEHandler() http.Handler {
 			return
 		}
 
-		// 2.有进度下载
+		// 2. Download with progress
 		sendProgress("downloading", 0, "正在下载更新...")
 		logger.Info("[系统更新] 开始下载更新", "url", info.DownloadURL)
 
 		lastProgress := 0
 		tempFile, err := downloadBinaryWithProgressAndRetry(info.DownloadURL, func(downloaded, total int64) {
 			progress := int(downloaded * 100 / total)
-			// 仅每 5% 发送一次更新以减少流量
+			// Only send update every 5% to reduce traffic
 			if progress >= lastProgress+5 || progress == 100 {
 				lastProgress = progress
 				sendProgress("downloading", progress, fmt.Sprintf("正在下载... %d%%", progress))
@@ -218,23 +214,20 @@ func NewUpdateApplySSEHandler() http.Handler {
 		}
 		defer os.Remove(tempFile)
 
-		// 3. 获取目标路径
+		// 3. Get target path
 		targetPath, err := getUpdateTargetPath()
 		if err != nil {
 			sendProgress("error", 0, fmt.Sprintf("获取程序路径失败: %v", err))
 			return
 		}
 
-		// 4. 备份当前版本（仅适用于非Docker）
-		if !isDocker() {
-			sendProgress("backing_up", 0, "正在备份当前版本...")
-			backupPath := targetPath + ".bak"
-			if err := copyFile(targetPath, backupPath); err != nil {
-				logger.Warn("[系统更新] 备份当前版本失败（非致命错误）", "error", err)
-			}
+		// 4. Backup current version (only for non-Docker)
+		sendProgress("backing_up", 0, "正在备份当前版本...")
+		if err := backupBinary(targetPath); err != nil {
+			logger.Warn("[系统更新] 备份当前版本失败（非致命错误）", "error", err)
 		}
 
-		// 5. 替换二进制文件
+		// 5. Replace binary
 		sendProgress("replacing", 0, "正在替换文件...")
 		logger.Info("[系统更新] 正在替换二进制文件", "from", tempFile, "to", targetPath)
 		if err := replaceBinary(tempFile, targetPath); err != nil {
@@ -242,20 +235,20 @@ func NewUpdateApplySSEHandler() http.Handler {
 			return
 		}
 
-		// 6.设置执行权限
+		// 6. Set execute permission
 		if err := os.Chmod(targetPath, 0755); err != nil {
 			sendProgress("error", 0, fmt.Sprintf("设置权限失败: %v", err))
 			return
 		}
 
-		// 7.发送重启状态
+		// 7. Send restarting status
 		sendProgress("restarting", 0, "更新完成，正在重启服务...")
 		logger.Info("[系统更新] 更新成功，准备重启服务器")
 
-		// 8. 发送完成状态
+		// 8. Send done status
 		sendProgress("done", 100, "更新完成")
 
-		// 9.异步重启（给客户端时间接收响应）
+		// 9. Restart asynchronously (give client time to receive response)
 		go func() {
 			time.Sleep(500 * time.Millisecond)
 			restartSelf(targetPath)
@@ -263,13 +256,15 @@ func NewUpdateApplySSEHandler() http.Handler {
 	})
 }
 
-// 从 GitHub 获取最新版本信息
+// checkLatestVersion fetches the latest release info from GitHub
 func checkLatestVersion() (*UpdateInfo, error) {
 	url := fmt.Sprintf(githubAPIURL, githubRepo)
+	logger.Debug("[系统更新] 检查更新", "url", url)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
+		logger.Error("[系统更新] 创建请求失败", "error", err)
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
@@ -277,23 +272,27 @@ func checkLatestVersion() (*UpdateInfo, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
+		logger.Error("[系统更新] 请求GitHub API失败", "error", err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		logger.Error("[系统更新] GitHub API返回错误", "status", resp.StatusCode)
 		return nil, fmt.Errorf("GitHub API 返回状态码: %d", resp.StatusCode)
 	}
 
 	var release GitHubRelease
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		logger.Error("[系统更新] 解析GitHub响应失败", "error", err)
 		return nil, fmt.Errorf("解析 GitHub 响应失败: %w", err)
 	}
+	logger.Debug("[系统更新] 获取到最新版本", "tag", release.TagName)
 
-	// 根据当前操作系统/架构选择下载 URL
+	// Select download URL based on current OS/arch
 	arch := runtime.GOARCH
 	osName := runtime.GOOS
-	binaryName := fmt.Sprintf("mmwx-%s-%s", osName, arch)
+	binaryName := fmt.Sprintf("mmw-%s-%s", osName, arch)
 
 	var downloadURL string
 	for _, asset := range release.Assets {
@@ -316,7 +315,7 @@ func checkLatestVersion() (*UpdateInfo, error) {
 	}, nil
 }
 
-// 如果最新 > 当前，compareVersions 返回 true
+// compareVersions returns true if latest > current
 func compareVersions(current, latest string) bool {
 	currentParts := parseVersion(current)
 	latestParts := parseVersion(latest)
@@ -340,7 +339,7 @@ func compareVersions(current, latest string) bool {
 	return false
 }
 
-// 将版本字符串拆分为整数部分
+// parseVersion splits version string into integer parts
 func parseVersion(v string) []int {
 	v = strings.TrimPrefix(v, "v")
 	parts := strings.Split(v, ".")
@@ -353,7 +352,7 @@ func parseVersion(v string) []int {
 	return result
 }
 
-// downloadBinary 将二进制文件下载到临时文件
+// downloadBinary downloads the binary to a temp file
 // GitHub 代理地址
 const githubProxyURL = "https://1ms.cc/"
 
@@ -361,13 +360,13 @@ func downloadBinary(url string) (string, error) {
 	return downloadBinaryWithProgress(url, nil)
 }
 
-// downloadBinaryWithProgress 使用进度回调将二进制文件下载到临时文件
+// downloadBinaryWithProgress downloads the binary to a temp file with progress callback
 // 如果直接下载失败或超时，会尝试使用 GitHub 代理重试
 func downloadBinaryWithProgress(url string, onProgress func(downloaded, total int64)) (string, error) {
 	return downloadBinaryWithProgressAndRetry(url, onProgress, nil)
 }
 
-// 下载二进制文件，支持进度回调和重试通知
+// downloadBinaryWithProgressAndRetry 下载二进制文件，支持进度回调和重试通知
 func downloadBinaryWithProgressAndRetry(url string, onProgress func(downloaded, total int64), onRetry func(proxyURL string)) (string, error) {
 	// 首先尝试直接下载，使用较短的超时时间
 	tempFile, err := downloadBinaryDirect(url, onProgress, 60*time.Second)
@@ -394,7 +393,7 @@ func downloadBinaryWithProgressAndRetry(url string, onProgress func(downloaded, 
 	return tempFile, nil
 }
 
-// 直接下载二进制文件（不含重试逻辑）
+// downloadBinaryDirect 直接下载二进制文件（不含重试逻辑）
 func downloadBinaryDirect(url string, onProgress func(downloaded, total int64), timeout time.Duration) (string, error) {
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Get(url)
@@ -415,7 +414,7 @@ func downloadBinaryDirect(url string, onProgress func(downloaded, total int64), 
 	totalSize := resp.ContentLength
 	var downloaded int64
 
-	// 如果没有进度回调或未知大小，请使用简单复制
+	// If no progress callback or unknown size, use simple copy
 	if onProgress == nil || totalSize <= 0 {
 		if _, err := io.Copy(tempFile, resp.Body); err != nil {
 			tempFile.Close()
@@ -423,8 +422,8 @@ func downloadBinaryDirect(url string, onProgress func(downloaded, total int64), 
 			return "", err
 		}
 	} else {
-		// 复制并跟踪进度
-		buf := make([]byte, 32*1024) // 32KB缓冲区
+		// Copy with progress tracking
+		buf := make([]byte, 32*1024) // 32KB buffer
 		for {
 			n, readErr := resp.Body.Read(buf)
 			if n > 0 {
@@ -451,19 +450,19 @@ func downloadBinaryDirect(url string, onProgress func(downloaded, total int64), 
 	return tempFile.Name(), nil
 }
 
-// 返回二进制文件应放置的路径
+// getUpdateTargetPath returns the path where the binary should be placed
 func getUpdateTargetPath() (string, error) {
 	if isDocker() {
-		// 在Docker中，写入持久数据目录
+		// In Docker, write to persistent data directory
 		targetPath := "/app/data/server"
-		// 确保数据目录存在
+		// Ensure data directory exists
 		if err := os.MkdirAll("/app/data", 0755); err != nil {
 			return "", err
 		}
 		return targetPath, nil
 	}
 
-	// 非 Docker：获取当前可执行路径
+	// Non-Docker: get current executable path
 	execPath, err := os.Executable()
 	if err != nil {
 		return "", err
@@ -475,19 +474,23 @@ func getUpdateTargetPath() (string, error) {
 	return execPath, nil
 }
 
-// 检查是否在 Docker 容器内运行
+// IsDockerEnvironment 是 isDocker 的导出封装,供 cmd/server 判断是否处于 Docker
+// (「仅本机访问」开关在 Docker 里要忽略:容器内 127.0.0.1 收不到宿主转发的端口)。
+func IsDockerEnvironment() bool { return isDocker() }
+
+// isDocker checks if running inside a Docker container
 func isDocker() bool {
-	// 检查 /.dockerenv 文件
+	// Check for /.dockerenv file
 	if _, err := os.Stat("/.dockerenv"); err == nil {
 		return true
 	}
 
-	// 检查 DOCKER 环境变量
+	// Check for DOCKER environment variable
 	if os.Getenv("DOCKER") == "1" {
 		return true
 	}
 
-	// 检查 docker 的 cgroup
+	// Check cgroup for docker
 	data, err := os.ReadFile("/proc/1/cgroup")
 	if err == nil && strings.Contains(string(data), "docker") {
 		return true
@@ -496,31 +499,31 @@ func isDocker() bool {
 	return false
 }
 
-// ReplaceBinary 将目标替换为新的二进制文件
+// replaceBinary replaces the target with the new binary
 func replaceBinary(src, dst string) error {
-	// 在 Linux 上，我们可以删除正在运行的二进制文件（它保留在内存中）
-	// 然后重命名新文件以取代它的位置
+	// On Linux, we can delete the running binary (it stays in memory)
+	// then rename the new file to take its place
 
-	// 首先，尝试删除旧的二进制文件
+	// First, try to remove the old binary
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-		// 如果删除失败（例如权限被拒绝），请尝试直接重命名
+		// If removal fails (e.g., permission denied), try direct rename
 		if err := os.Rename(src, dst); err == nil {
 			return nil
 		}
-		// 如果重命名也失败，请尝试复制
+		// If rename also fails, try copy
 		return copyFile(src, dst)
 	}
 
-	// 旧的二进制文件已删除（或不存在），现在重命名新的二进制文件
+	// Old binary removed (or didn't exist), now rename new binary
 	if err := os.Rename(src, dst); err != nil {
-		// 重命名失败（跨设备），请尝试复制
+		// Rename failed (cross-device), try copy instead
 		return copyFile(src, dst)
 	}
 
 	return nil
 }
 
-// 将文件从 src 复制到 dst
+// copyFile copies a file from src to dst
 func copyFile(src, dst string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
@@ -528,7 +531,7 @@ func copyFile(src, dst string) error {
 	}
 	defer srcFile.Close()
 
-	// 创建目标文件（如果存在则截断）
+	// Create destination file (truncate if exists)
 	dstFile, err := os.Create(dst)
 	if err != nil {
 		return err
@@ -542,17 +545,75 @@ func copyFile(src, dst string) error {
 	return dstFile.Sync()
 }
 
-// 重新启动当前进程
+const maxBackups = 2
+
+func backupBinary(targetPath string) error {
+	if _, err := os.Stat(targetPath); err != nil {
+		return nil
+	}
+
+	backupDir := "data"
+	if isDocker() {
+		backupDir = "/app/data"
+	}
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		return fmt.Errorf("创建备份目录失败: %w", err)
+	}
+
+	backupName := fmt.Sprintf("server.bak.%s.%s",
+		version.Version,
+		time.Now().Format("20060102-150405"),
+	)
+	backupPath := filepath.Join(backupDir, backupName)
+
+	if err := copyFile(targetPath, backupPath); err != nil {
+		return err
+	}
+	logger.Info("[系统更新] 备份完成", "path", backupPath)
+
+	cleanOldBackups(backupDir)
+	return nil
+}
+
+func cleanOldBackups(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	var backups []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), "server.bak.") {
+			backups = append(backups, e.Name())
+		}
+	}
+
+	if len(backups) <= maxBackups {
+		return
+	}
+
+	sort.Strings(backups)
+	for _, name := range backups[:len(backups)-maxBackups] {
+		path := filepath.Join(dir, name)
+		if err := os.Remove(path); err != nil {
+			logger.Warn("[系统更新] 删除旧备份失败", "path", path, "error", err)
+		} else {
+			logger.Info("[系统更新] 已删除旧备份", "path", path)
+		}
+	}
+}
+
+// restartSelf restarts the current process
 func restartSelf(execPath string) {
 	logger.Info("[系统重启] 正在重启服务器", "exec_path", execPath)
 
-	// 使用syscall.Exec替换当前进程（PID保持不变）
-	// 这对于 Docker 来说很重要，因为 PID 1 必须保持活动状态
+	// Use syscall.Exec to replace current process (PID stays the same)
+	// This is important for Docker where PID 1 must stay alive
 	err := syscall.Exec(execPath, os.Args, os.Environ())
 	if err != nil {
 		logger.Warn("[系统重启] syscall.Exec失败，尝试启动新进程", "error", err)
 
-		// Fallback：启动新进程并退出
+		// Fallback: start new process and exit
 		cmd := exec.Command(execPath, os.Args[1:]...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr

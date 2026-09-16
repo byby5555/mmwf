@@ -3,7 +3,6 @@ package handler
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,7 +26,7 @@ type applyCustomRulesResponse struct {
 	AddedProxyGroups []string `json:"added_proxy_groups,omitempty"`
 }
 
-// 返回将自定义规则应用于 YAML 内容的处理程序
+// NewApplyCustomRulesHandler returns a handler that applies custom rules to YAML content
 func NewApplyCustomRulesHandler(repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
 		panic("apply custom rules handler requires repository")
@@ -45,10 +44,10 @@ func NewApplyCustomRulesHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 
-		// 检查自定义规则是否启用
+		// Check if custom rules are enabled
 		settings, err := repo.GetUserSettings(r.Context(), username)
 		if err != nil || !settings.CustomRulesEnabled {
-			// 如果未启用，则返回原始YAML
+			// If not enabled, just return the original YAML
 			var payload applyCustomRulesRequest
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 				writeError(w, http.StatusBadRequest, err)
@@ -75,17 +74,13 @@ func NewApplyCustomRulesHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 
-		// 应用自定义规则
-		// 普通用户预览只应用自己的规则;管理员可应用全部(owner="")。
-		owner := username
-		if userIsAdmin(r.Context(), repo, username) {
-			owner = ""
-		}
-		modifiedYaml, addedGroups, err := applyCustomRulesToYaml(r.Context(), repo, []byte(payload.YamlContent), owner)
+		// Apply custom rules
+		modifiedYaml, addedGroups, err := applyCustomRulesToYaml(r.Context(), repo, []byte(payload.YamlContent))
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to apply custom rules: %w", err))
 			return
 		}
+
 
 		resp := applyCustomRulesResponse{
 			YamlContent:      string(modifiedYaml),
@@ -97,20 +92,17 @@ func NewApplyCustomRulesHandler(repo *storage.TrafficRepository) http.Handler {
 	})
 }
 
-// applyCustomRulesToYaml 将启用的自定义规则应用于 YAML 数据
-// 返回修改后的 YAML 和添加的代理组列表
-func applyCustomRulesToYaml(ctx context.Context, repo *storage.TrafficRepository, yamlData []byte, owner string) ([]byte, []string, error) {
+func applyCustomRulesToYamlFiltered(ctx context.Context, repo *storage.TrafficRepository, yamlData []byte, selectedIDs map[int64]bool) ([]byte, []string, error) {
 	rules, err := repo.ListEnabledCustomRules(ctx, "")
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get custom rules: %w", err)
 	}
 
-	// 数据隔离:owner 非空时只应用该用户自己创建的规则(排除管理员/他人)。
-	if owner != "" {
+	if len(selectedIDs) > 0 {
 		filtered := rules[:0]
-		for _, ru := range rules {
-			if ru.CreatedBy == owner {
-				filtered = append(filtered, ru)
+		for _, r := range rules {
+			if selectedIDs[r.ID] {
+				filtered = append(filtered, r)
 			}
 		}
 		rules = filtered
@@ -120,23 +112,18 @@ func applyCustomRulesToYaml(ctx context.Context, repo *storage.TrafficRepository
 		return yamlData, nil, nil
 	}
 
-	// 将 YAML 数据解析为 Node 以保留结构和顺序
 	var rootNode yaml.Node
 	if err := yaml.Unmarshal(yamlData, &rootNode); err != nil {
 		return nil, nil, fmt.Errorf("failed to parse YAML: %w", err)
 	}
-
-	// 获取文档节点
 	if rootNode.Kind != yaml.DocumentNode || len(rootNode.Content) == 0 {
 		return yamlData, nil, nil
 	}
-
 	docNode := rootNode.Content[0]
 	if docNode.Kind != yaml.MappingNode {
 		return yamlData, nil, nil
 	}
 
-	// 使用 Node API 根据其类型应用每个规则
 	for _, rule := range rules {
 		switch rule.Type {
 		case "dns":
@@ -148,10 +135,8 @@ func applyCustomRulesToYaml(ctx context.Context, repo *storage.TrafficRepository
 		}
 	}
 
-	// 自动添加规则中引用的缺失代理组
 	addedGroups := autoAddMissingProxyGroups(docNode)
 
-	// 校验应用规则后的配置
 	var configMap map[string]interface{}
 	var tempBuf bytes.Buffer
 	tempEncoder := yaml.NewEncoder(&tempBuf)
@@ -180,7 +165,6 @@ func applyCustomRulesToYaml(ctx context.Context, repo *storage.TrafficRepository
 		return nil, nil, fmt.Errorf("配置校验失败: %s", strings.Join(errorMessages, "; "))
 	}
 
-	// 如果有自动修复，使用修复后的配置
 	if validationResult.FixedConfig != nil {
 		fixedYAML, err := yaml.Marshal(validationResult.FixedConfig)
 		if err != nil {
@@ -189,8 +173,6 @@ func applyCustomRulesToYaml(ctx context.Context, repo *storage.TrafficRepository
 		if err := yaml.Unmarshal(fixedYAML, &rootNode); err != nil {
 			return nil, nil, fmt.Errorf("解析修复配置失败: %w", err)
 		}
-
-		// 记录自动修复的警告
 		for _, issue := range validationResult.Issues {
 			if issue.Level == validator.WarningLevel && issue.AutoFixed {
 				logger.Info("[应用自定义规则] [配置校验] 警告(已修复)", "message", issue.Message, "location", issue.Location)
@@ -198,329 +180,62 @@ func applyCustomRulesToYaml(ctx context.Context, repo *storage.TrafficRepository
 		}
 	}
 
-	// 修复短 ID 字段以在封送之前使用双引号
 	fixShortIdStyleInNode(&rootNode)
 
-	// Marshal the modified node (使用2空格缩进)
 	modifiedData, err := MarshalYAMLWithIndent(&rootNode)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to marshal modified YAML: %w", err)
 	}
 
-	// 后处理以从带有 Unicode 字符（表情符号）的字符串中删除引号
 	result := RemoveUnicodeEscapeQuotes(string(modifiedData))
-
 	return []byte(result), addedGroups, nil
 }
 
-// applyCustomRulesToYamlSmart 通过智能重复数据删除应用自定义规则
-// 此功能用于自动同步，以避免前置模式下重复内容
-func applyCustomRulesToYamlSmart(ctx context.Context, repo *storage.TrafficRepository, yamlData []byte, subscribeFileID int64) ([]byte, []string, error) {
-	// 获取启用的自定义规则
-	rules, err := repo.ListEnabledCustomRules(ctx, "")
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get custom rules: %w", err)
-	}
-
-	// 数据隔离 + 订阅级选择:
-	//   - 只应用该订阅"所有者"自己创建的覆写规则(排除管理员/他人的规则);
-	//   - 若该订阅指定了生效规则集(SelectedCustomRuleIDs),进一步只应用选中的。
-	// 兼容:历史/管理员订阅 CreatedBy 为空时不做所有者过滤(沿用旧的"全部启用生效")。
-	if sf, ferr := repo.GetSubscribeFileByID(ctx, subscribeFileID); ferr == nil {
-		selected := makeIDSet(sf.SelectedCustomRuleIDs)
-		filtered := rules[:0]
-		for _, ru := range rules {
-			if sf.CreatedBy != "" && ru.CreatedBy != sf.CreatedBy {
-				continue
-			}
-			if len(selected) > 0 && !selected[ru.ID] {
-				continue
-			}
-			filtered = append(filtered, ru)
-		}
-		rules = filtered
-	}
-
-	if len(rules) == 0 {
-		return yamlData, nil, nil
-	}
-
-	// 获取历史申请记录
-	applications, err := repo.GetCustomRuleApplications(ctx, subscribeFileID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get custom rule applications: %w", err)
-	}
-
-	// 构建历史应用地图以便快速查找
-	historyMap := make(map[string]*storage.CustomRuleApplication)
-	for i := range applications {
-		key := fmt.Sprintf("%d-%s", applications[i].CustomRuleID, applications[i].RuleType)
-		historyMap[key] = &applications[i]
-	}
-
-	// 使用 Node API 解析 YAML 以保留顺序
-	var rootNode yaml.Node
-	if err := yaml.Unmarshal(yamlData, &rootNode); err != nil {
-		return nil, nil, fmt.Errorf("failed to parse YAML: %w", err)
-	}
-
-	// 获取文档节点
-	if rootNode.Kind != yaml.DocumentNode || len(rootNode.Content) == 0 {
-		return yamlData, nil, nil
-	}
-
-	docNode := rootNode.Content[0]
-	if docNode.Kind != yaml.MappingNode {
-		return yamlData, nil, nil
-	}
-
-	// 使用 Node API 应用每个规则并进行重复数据删除
-	for _, rule := range rules {
-		key := fmt.Sprintf("%d-%s", rule.ID, rule.Type)
-		prevApp := historyMap[key]
-
-		// 计算内容哈希以进行更改检测
-		contentHash := fmt.Sprintf("%x", sha256.Sum256([]byte(rule.Content)))
-
-		// 如果内容没有改变并且模式被替换，则跳过
-		if prevApp != nil && prevApp.ContentHash == contentHash && rule.Mode == "replace" {
-			continue
-		}
-
-		switch rule.Type {
-		case "dns":
-			applyDNSRuleToNodeSmart(docNode, rule, prevApp, ctx, repo, subscribeFileID, contentHash)
-
-		case "rules":
-			applyRulesRuleToNodeSmart(docNode, rule, prevApp, ctx, repo, subscribeFileID, contentHash)
-
-		case "rule-providers":
-			applyRuleProvidersRuleToNodeSmart(docNode, rule, prevApp, ctx, repo, subscribeFileID, contentHash)
-		}
-	}
-
-	// 自动添加规则中引用的缺失代理组
-	addedGroups := autoAddMissingProxyGroups(docNode)
-
-	// 修复短 ID 字段以在封送之前使用双引号
-	fixShortIdStyleInNode(&rootNode)
-
-	// Marshal the modified node (使用2空格缩进)
-	modifiedData, err := MarshalYAMLWithIndent(&rootNode)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to marshal modified YAML: %w", err)
-	}
-
-	// 后处理以从带有 Unicode 字符（表情符号）的字符串中删除引号
-	result := RemoveUnicodeEscapeQuotes(string(modifiedData))
-
-	return []byte(result), addedGroups, nil
+// applyCustomRulesToYaml applies enabled custom rules to the YAML data
+func applyCustomRulesToYaml(ctx context.Context, repo *storage.TrafficRepository, yamlData []byte) ([]byte, []string, error) {
+	return applyCustomRulesToYamlFiltered(ctx, repo, yamlData, nil)
 }
 
-// 应用 DNS 自定义规则
-func applyDNSRule(config map[string]interface{}, rule storage.CustomRule, prevApp *storage.CustomRuleApplication) error {
-	var parsedContent map[string]interface{}
-	if err := yaml.Unmarshal([]byte(rule.Content), &parsedContent); err != nil {
-		return err
-	}
-
-	if dnsValue, hasDnsKey := parsedContent["dns"]; hasDnsKey {
-		config["dns"] = dnsValue
-	} else {
-		config["dns"] = parsedContent
-	}
-
-	return nil
-}
-
-// 应用具有重复数据删除功能的自定义规则
-func applyRulesRule(config map[string]interface{}, rule storage.CustomRule, prevApp *storage.CustomRuleApplication) (string, error) {
-	// 解析规则内容
-	var newRules []interface{}
-
-	// 尝试首先解析为地图（使用“rules:”键）
-	var parsedAsMap map[string]interface{}
-	if err := yaml.Unmarshal([]byte(rule.Content), &parsedAsMap); err == nil {
-		if rulesValue, hasRulesKey := parsedAsMap["rules"]; hasRulesKey {
-			if rulesArray, ok := rulesValue.([]interface{}); ok {
-				newRules = rulesArray
-			}
-		}
-	}
-
-	// 尝试解析为 YAML 数组
-	if len(newRules) == 0 {
-		if err := yaml.Unmarshal([]byte(rule.Content), &newRules); err != nil {
-			// 解析为纯文本
-			lines := strings.Split(rule.Content, "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if line != "" && !strings.HasPrefix(line, "#") {
-					newRules = append(newRules, line)
-				}
-			}
-		}
-	}
-
-	if len(newRules) == 0 {
-		return "", errors.New("no rules parsed")
-	}
-
-	// 获取现有规则
-	existingRules, ok := config["rules"].([]interface{})
-	if !ok {
-		existingRules = []interface{}{}
-	}
-
-	if rule.Mode == "replace" {
-		config["rules"] = newRules
-	} else if rule.Mode == "prepend" {
-		// 删除历史内容（如果存在）
-		if prevApp != nil && prevApp.AppliedContent != "" {
-			var historicalRules []interface{}
-			if err := json.Unmarshal([]byte(prevApp.AppliedContent), &historicalRules); err == nil {
-				existingRules = removeRulesFromList(existingRules, historicalRules)
-			}
-		}
-		// 前置新规则
-		config["rules"] = append(newRules, existingRules...)
-	} else if rule.Mode == "append" {
-		// 删除历史内容（如果存在）
-		if prevApp != nil && prevApp.AppliedContent != "" {
-			var historicalRules []interface{}
-			if err := json.Unmarshal([]byte(prevApp.AppliedContent), &historicalRules); err == nil {
-				existingRules = removeRulesFromList(existingRules, historicalRules)
-			}
-		}
-		// 从现有规则中删除与新规则匹配的任何规则（不区分大小写，基于第二个逗号之前的文本）
-		existingRules = removeDuplicateRulesCaseInsensitive(existingRules, newRules)
-		// 追加新规则
-		config["rules"] = append(existingRules, newRules...)
-	}
-
-	// 序列化应用的内容以进行跟踪
-	appliedJSON, _ := json.Marshal(newRules)
-	return string(appliedJSON), nil
-}
-
-// 应用具有重复数据删除功能的规则提供者自定义规则
-func applyRuleProvidersRule(config map[string]interface{}, rule storage.CustomRule, prevApp *storage.CustomRuleApplication) (string, error) {
-	var parsedContent map[string]interface{}
-	if err := yaml.Unmarshal([]byte(rule.Content), &parsedContent); err != nil {
-		return "", err
-	}
-
-	// 提取提供商地图
-	var providersMap map[string]interface{}
-	if providersValue, hasProvidersKey := parsedContent["rule-providers"]; hasProvidersKey {
-		var ok bool
-		providersMap, ok = providersValue.(map[string]interface{})
-		if !ok {
-			return "", errors.New("invalid rule-providers format")
-		}
-	} else {
-		providersMap = parsedContent
-	}
-
-	if len(providersMap) == 0 {
-		return "", errors.New("no providers parsed")
-	}
-
-	existingProviders, ok := config["rule-providers"].(map[string]interface{})
-	if !ok {
-		existingProviders = make(map[string]interface{})
-	}
-
-	if rule.Mode == "replace" {
-		config["rule-providers"] = providersMap
-	} else if rule.Mode == "prepend" {
-		// 删除历史提供程序（如果存在）
-		if prevApp != nil && prevApp.AppliedContent != "" {
-			var historicalProviders map[string]interface{}
-			if err := json.Unmarshal([]byte(prevApp.AppliedContent), &historicalProviders); err == nil {
-				for key := range historicalProviders {
-					delete(existingProviders, key)
-				}
-			}
-		}
-		// 合并新提供商（新提供商优先）
-		for k, v := range providersMap {
-			existingProviders[k] = v
-		}
-		config["rule-providers"] = existingProviders
-	}
-
-	// 序列化应用的内容以进行跟踪
-	appliedJSON, _ := json.Marshal(providersMap)
-	return string(appliedJSON), nil
-}
-
-// 从列表中删除规则
-func removeRulesFromList(existing []interface{}, toRemove []interface{}) []interface{} {
-	// 构建一组要删除的规则以进行 O(n) 查找
-	removeSet := make(map[string]bool)
-	for _, rule := range toRemove {
-		if ruleStr, ok := rule.(string); ok {
-			removeSet[ruleStr] = true
-		}
-	}
-
-	// 过滤掉删除集中的规则
-	var filtered []interface{}
-	for _, rule := range existing {
-		if ruleStr, ok := rule.(string); ok {
-			if !removeSet[ruleStr] {
-				filtered = append(filtered, rule)
-			}
-		} else {
-			// 保持非字符串规则不变
-			filtered = append(filtered, rule)
-		}
-	}
-
-	return filtered
-}
-
-// 从现有列表中删除与 newRules 匹配的规则（不区分大小写）
+// removeDuplicateRulesCaseInsensitive removes rules from existing list that match newRules (case-insensitive)
 func removeDuplicateRulesCaseInsensitive(existing []interface{}, newRules []interface{}) []interface{} {
-	// 为 O(n) 查找构建一组小写新规则
-	// 提取第二个逗号之前的文本进行比较
+	// Build a set of new rules in lowercase for O(n) lookup
+	// Extract text before second comma for comparison
 	newRulesSet := make(map[string]bool)
 	hasMatchRule := false
 	for _, rule := range newRules {
 		if ruleStr, ok := rule.(string); ok {
-			// 提取第二个逗号之前的文本
+			// Extract text before second comma
 			key := extractRuleKey(ruleStr)
 			newRulesSet[strings.ToLower(key)] = true
 
-			// 检查newRules中是否有MATCH规则（处理带有“-”前缀的YAML格式）
+			// Check if there's a MATCH rule in newRules (handle YAML format with "- " prefix)
 			if isMatchRule(ruleStr) {
 				hasMatchRule = true
 			}
 		}
 	}
 
-	// 过滤掉与新规则匹配的现有规则（不区分大小写）
+	// Filter out existing rules that match new rules (case-insensitive)
 	var filtered []interface{}
 	for _, rule := range existing {
 		if ruleStr, ok := rule.(string); ok {
-			// 提取第二个逗号之前的文本进行比较
+			// Extract text before second comma for comparison
 			key := extractRuleKey(ruleStr)
 
-			// 如果 newRules 包含 MATCH 规则，则从现有规则中删除所有 MATCH 规则
+			// If newRules contains MATCH rule, remove all MATCH rules from existing
 			if hasMatchRule && isMatchRule(ruleStr) {
 				logger.Info("删除重复的MATCH规则", "rule", ruleStr)
 				continue
 			}
 
-			// 仅保留不重复的内容（不区分大小写）
+			// Only keep if not a duplicate (case-insensitive)
 			if !newRulesSet[strings.ToLower(key)] {
 				filtered = append(filtered, rule)
 			} else {
 				logger.Info("删除重复规则", "rule", ruleStr)
 			}
 		} else {
-			// 保持非字符串规则不变
+			// Keep non-string rules as-is
 			filtered = append(filtered, rule)
 		}
 	}
@@ -528,9 +243,9 @@ func removeDuplicateRulesCaseInsensitive(existing []interface{}, newRules []inte
 	return filtered
 }
 
-// 从规则字符串中提取第二个逗号之前的文本
+// extractRuleKey extracts text before the second comma from a rule string
 func extractRuleKey(ruleStr string) string {
-	// 计算逗号并提取第二个逗号之前的文本
+	// Count commas and extract text before second comma
 	commaCount := 0
 	for i, ch := range ruleStr {
 		if ch == ',' {
@@ -540,25 +255,25 @@ func extractRuleKey(ruleStr string) string {
 			}
 		}
 	}
-	// 如果少于 2 个逗号，则返回整个字符串
+	// If less than 2 commas, return the whole string
 	return ruleStr
 }
 
-// 检查规则字符串是否为 MATCH 规则（处理带“-”前缀的 YAML 格式）
+// isMatchRule checks if a rule string is a MATCH rule (handles YAML format with "- " prefix)
 func isMatchRule(ruleStr string) bool {
-	// 修剪空格并删除 YAML 列表前缀“-”（如果存在）
+	// Trim whitespace and remove YAML list prefix "- " if present
 	trimmed := strings.TrimSpace(ruleStr)
 	if strings.HasPrefix(trimmed, "- ") {
 		trimmed = strings.TrimSpace(trimmed[2:])
 	}
-	// 检查是否以 MATCH 开头（不区分大小写）
+	// Check if it starts with MATCH (case-insensitive)
 	return strings.HasPrefix(strings.ToUpper(trimmed), "MATCH")
 }
 
-// removeDuplicateNodesBasedOnNewRules 根据 newRules 从现有的 yaml 节点中删除重复的 yaml 节点
-// 使用与removeDuplicateRulesCaseInsensitive相同的逻辑，但与yaml.Node一起使用
+// removeDuplicateNodesBasedOnNewRules removes duplicate yaml nodes from existing based on newRules
+// Uses the same logic as removeDuplicateRulesCaseInsensitive but works with yaml.Node
 func removeDuplicateNodesBasedOnNewRules(existing []*yaml.Node, newRules []*yaml.Node) []*yaml.Node {
-	// 为 O(n) 查找构建一组小写新规则
+	// Build a set of new rules in lowercase for O(n) lookup
 	newRulesSet := make(map[string]bool)
 	hasMatchRule := false
 
@@ -574,14 +289,14 @@ func removeDuplicateNodesBasedOnNewRules(existing []*yaml.Node, newRules []*yaml
 		}
 	}
 
-	// 过滤掉与新规则匹配的现有规则
+	// Filter out existing rules that match new rules
 	var filtered []*yaml.Node
 
 	for _, node := range existing {
 		if node.Kind == yaml.ScalarNode {
 			ruleStr := node.Value
 
-			// 始终保留规则集规则
+			// Always preserve RULE-SET rules
 			trimmed := strings.TrimSpace(ruleStr)
 			if strings.HasPrefix(trimmed, "- ") {
 				trimmed = strings.TrimSpace(trimmed[2:])
@@ -593,20 +308,20 @@ func removeDuplicateNodesBasedOnNewRules(existing []*yaml.Node, newRules []*yaml
 
 			key := extractRuleKey(ruleStr)
 
-			// 如果 newRules 包含 MATCH 规则，则从现有规则中删除所有 MATCH 规则
+			// If newRules contains MATCH rule, remove all MATCH rules from existing
 			if hasMatchRule && isMatchRule(ruleStr) {
 				logger.Info("删除重复的MATCH规则", "rule", ruleStr)
 				continue
 			}
 
-			// 仅保留（如果不重复）
+			// Only keep if not a duplicate
 			if !newRulesSet[strings.ToLower(key)] {
 				filtered = append(filtered, node)
 			} else {
 				logger.Info("删除重复规则", "rule", ruleStr)
 			}
 		} else {
-			// 保持非标量节点不变
+			// Keep non-scalar nodes as-is
 			filtered = append(filtered, node)
 		}
 	}
@@ -614,21 +329,7 @@ func removeDuplicateNodesBasedOnNewRules(existing []*yaml.Node, newRules []*yaml
 	return filtered
 }
 
-// recordApplication记录了将来重复数据删除所应用的内容
-func recordApplication(ctx context.Context, repo *storage.TrafficRepository, fileID int64, rule storage.CustomRule, appliedContent string, contentHash string) error {
-	app := &storage.CustomRuleApplication{
-		SubscribeFileID: fileID,
-		CustomRuleID:    rule.ID,
-		RuleType:        rule.Type,
-		RuleMode:        rule.Mode,
-		AppliedContent:  appliedContent,
-		ContentHash:     contentHash,
-	}
-
-	return repo.UpsertCustomRuleApplication(ctx, app)
-}
-
-// 从规则节点中提取 RULE-SET 类型规则
+// extractRuleSetRules extracts RULE-SET type rules from a rules node
 func extractRuleSetRules(rulesNode *yaml.Node) []*yaml.Node {
 	var ruleSetRules []*yaml.Node
 	if rulesNode == nil || rulesNode.Kind != yaml.SequenceNode {
@@ -641,7 +342,7 @@ func extractRuleSetRules(rulesNode *yaml.Node) []*yaml.Node {
 			if strings.HasPrefix(trimmed, "- ") {
 				trimmed = strings.TrimSpace(trimmed[2:])
 			}
-			// 检查这是否是 RULE-SET 规则（不区分大小写）
+			// Check if this is a RULE-SET rule (case-insensitive)
 			if strings.HasPrefix(strings.ToUpper(trimmed), "RULE-SET") {
 				ruleSetRules = append(ruleSetRules, node)
 			}
@@ -650,22 +351,22 @@ func extractRuleSetRules(rulesNode *yaml.Node) []*yaml.Node {
 	return ruleSetRules
 }
 
-// autoAddMissingProxyGroups 检查规则并自动添加缺少的代理组
-// 返回已添加的代理组名称的列表
+// autoAddMissingProxyGroups checks rules and auto-adds missing proxy groups
+// Returns a list of added proxy group names
 func autoAddMissingProxyGroups(docNode *yaml.Node) []string {
-	// 获取规则节点
+	// Get rules node
 	rulesNode, _ := findFieldNode(docNode, "rules")
 	if rulesNode == nil || rulesNode.Kind != yaml.SequenceNode {
 		return []string{}
 	}
 
-	// 获取代理组节点
+	// Get proxy-groups node
 	proxyGroupsNode, proxyGroupsIdx := findFieldNode(docNode, "proxy-groups")
 	if proxyGroupsNode == nil || proxyGroupsNode.Kind != yaml.SequenceNode {
 		return []string{}
 	}
 
-	// 收集现有代理组名称
+	// Collect existing proxy group names
 	existingGroups := make(map[string]bool)
 	for _, groupNode := range proxyGroupsNode.Content {
 		if groupNode.Kind == yaml.MappingNode {
@@ -676,38 +377,38 @@ func autoAddMissingProxyGroups(docNode *yaml.Node) []string {
 		}
 	}
 
-	// 收集规则中引用的代理组
+	// Collect proxy groups referenced in rules
 	referencedGroups := make(map[string]bool)
 	for _, ruleNode := range rulesNode.Content {
 		if ruleNode.Kind == yaml.ScalarNode {
-			// 解析规则：TYPE,PARAM,POLICY 或 TYPE,PARAM,POLICY,no-resolve
+			// Parse rule: TYPE,PARAM,POLICY or TYPE,PARAM,POLICY,no-resolve
 			parts := strings.Split(ruleNode.Value, ",")
 			if len(parts) >= 3 {
 				var policy string
-				// 检查最后一部分是否“无法解决”
+				// Check if last part is "no-resolve"
 				lastPart := strings.TrimSpace(parts[len(parts)-1])
 				if lastPart == "no-resolve" && len(parts) >= 4 {
-					// 策略在“no-resolve”之前：TYPE、PARAM、POLICY、no-resolve
+					// Policy is before "no-resolve": TYPE,PARAM,POLICY,no-resolve
 					policy = strings.TrimSpace(parts[len(parts)-2])
 				} else {
-					// 策略是最后一部分：TYPE,PARAM,POLICY
+					// Policy is the last part: TYPE,PARAM,POLICY
 					policy = lastPart
 				}
-				// 跳过内置策略
-				if policy != "DIRECT" && policy != "REJECT" && policy != "PROXY" && policy != "" {
+				// Skip built-in policies
+				if policy != "DIRECT" && policy != "REJECT" && policy != "REJECT-DROP" && policy != "PROXY" && policy != "" {
 					referencedGroups[policy] = true
 				}
 			} else if len(parts) == 2 {
-				// 匹配、策略格式
+				// MATCH,POLICY format
 				policy := strings.TrimSpace(parts[1])
-				if policy != "DIRECT" && policy != "REJECT" && policy != "PROXY" && policy != "" {
+				if policy != "DIRECT" && policy != "REJECT" && policy != "REJECT-DROP" && policy != "PROXY" && policy != "" {
 					referencedGroups[policy] = true
 				}
 			}
 		}
 	}
 
-	// 查找缺失的组
+	// Find missing groups
 	var missingGroups []string
 	for group := range referencedGroups {
 		if !existingGroups[group] {
@@ -715,13 +416,13 @@ func autoAddMissingProxyGroups(docNode *yaml.Node) []string {
 		}
 	}
 
-	// 添加缺失的组
+	// Add missing groups
 	if len(missingGroups) > 0 {
 		for _, groupName := range missingGroups {
 			logger.Info("自动添加缺失的代理组", "group_name", groupName)
 
-			// 根据组名称确定默认代理顺序
-			// 对于家政服务团体，DIRECT应该是第一位的
+			// Determine default proxies order based on group name
+			// For domestic service group, DIRECT should be first
 			var defaultProxies []*yaml.Node
 			if groupName == "🔒 国内服务" {
 				defaultProxies = []*yaml.Node{
@@ -735,7 +436,7 @@ func autoAddMissingProxyGroups(docNode *yaml.Node) []string {
 				}
 			}
 
-			// 创建新的代理组节点
+			// Create a new proxy group node
 			newGroupNode := &yaml.Node{
 				Kind: yaml.MappingNode,
 				Content: []*yaml.Node{
@@ -751,11 +452,11 @@ func autoAddMissingProxyGroups(docNode *yaml.Node) []string {
 				},
 			}
 
-			// 附加到代理组
+			// Append to proxy-groups
 			proxyGroupsNode.Content = append(proxyGroupsNode.Content, newGroupNode)
 		}
 
-		// 更新 docNode 中的 proxy-groups 节点
+		// Update the proxy-groups node in docNode
 		if proxyGroupsIdx >= 0 {
 			docNode.Content[proxyGroupsIdx] = proxyGroupsNode
 		}
@@ -764,18 +465,18 @@ func autoAddMissingProxyGroups(docNode *yaml.Node) []string {
 	return missingGroups
 }
 
-// 从规则内容中提取代理组名称
+// extractProxyGroupsFromRulesContent extracts proxy group names from rules content
 func extractProxyGroupsFromRulesContent(content string) []string {
 	var groups []string
 	groupSet := make(map[string]bool)
 
-	// 将内容解析为 YAML 以获取规则列表
+	// Parse content as YAML to get rules list
 	var rulesData interface{}
 	if err := yaml.Unmarshal([]byte(content), &rulesData); err != nil {
 		return groups
 	}
 
-	// 处理不同格式
+	// Handle different formats
 	var rulesList []string
 	switch v := rulesData.(type) {
 	case []interface{}:
@@ -794,7 +495,7 @@ func extractProxyGroupsFromRulesContent(content string) []string {
 		}
 	}
 
-	// 从规则中提取代理组
+	// Extract proxy groups from rules
 	for _, ruleStr := range rulesList {
 		parts := strings.Split(ruleStr, ",")
 		if len(parts) >= 3 {
@@ -805,8 +506,8 @@ func extractProxyGroupsFromRulesContent(content string) []string {
 			} else {
 				policy = lastPart
 			}
-			// 跳过内置策略
-			if policy != "DIRECT" && policy != "REJECT" && policy != "PROXY" && policy != "" {
+			// Skip built-in policies
+			if policy != "DIRECT" && policy != "REJECT" && policy != "REJECT-DROP" && policy != "PROXY" && policy != "" {
 				if !groupSet[policy] {
 					groupSet[policy] = true
 					groups = append(groups, policy)
@@ -814,7 +515,7 @@ func extractProxyGroupsFromRulesContent(content string) []string {
 			}
 		} else if len(parts) == 2 {
 			policy := strings.TrimSpace(parts[1])
-			if policy != "DIRECT" && policy != "REJECT" && policy != "PROXY" && policy != "" {
+			if policy != "DIRECT" && policy != "REJECT" && policy != "REJECT-DROP" && policy != "PROXY" && policy != "" {
 				if !groupSet[policy] {
 					groupSet[policy] = true
 					groups = append(groups, policy)
@@ -826,7 +527,7 @@ func extractProxyGroupsFromRulesContent(content string) []string {
 	return groups
 }
 
-// 在映射节点中通过键查找字段节点
+// findFieldNode finds a field node by key in a mapping node
 func findFieldNode(mappingNode *yaml.Node, key string) (*yaml.Node, int) {
 	if mappingNode.Kind != yaml.MappingNode {
 		return nil, -1
@@ -841,14 +542,14 @@ func findFieldNode(mappingNode *yaml.Node, key string) (*yaml.Node, int) {
 	return nil, -1
 }
 
-// 将 DNS 规则应用到 YAML 节点
+// applyDNSRuleToNode applies DNS rule to the YAML node
 func applyDNSRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 	var parsedContent yaml.Node
 	if err := yaml.Unmarshal([]byte(rule.Content), &parsedContent); err != nil {
 		return
 	}
 
-	// 检查解析的内容是否是文档节点
+	// Check if parsed content is a document node
 	var contentNode *yaml.Node
 	if parsedContent.Kind == yaml.DocumentNode && len(parsedContent.Content) > 0 {
 		contentNode = parsedContent.Content[0]
@@ -856,24 +557,24 @@ func applyDNSRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 		contentNode = &parsedContent
 	}
 
-	// 检查用户输入是否包含“dns:”键
+	// Check if user input contains "dns:" key
 	if dnsNode, _ := findFieldNode(contentNode, "dns"); dnsNode != nil {
-		// 替换整个 dns 块
+		// Replace the entire dns block
 		setFieldNode(docNode, "dns", dnsNode)
 	} else {
-		// 否则，替换为全部内容
+		// Otherwise, replace with the entire content
 		setFieldNode(docNode, "dns", contentNode)
 	}
 }
 
-// 将规则应用到 YAML 节点
+// applyRulesRuleToNode applies rules to the YAML node
 func applyRulesRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 	var parsedContent yaml.Node
 	if err := yaml.Unmarshal([]byte(rule.Content), &parsedContent); err != nil {
 		return
 	}
 
-	// 获取内容节点
+	// Get content node
 	var contentNode *yaml.Node
 	if parsedContent.Kind == yaml.DocumentNode && len(parsedContent.Content) > 0 {
 		contentNode = parsedContent.Content[0]
@@ -881,7 +582,7 @@ func applyRulesRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 		contentNode = &parsedContent
 	}
 
-	// 检查它是否包含“rules:”键
+	// Check if it contains "rules:" key
 	var newRulesNode *yaml.Node
 	if contentNode.Kind == yaml.MappingNode {
 		if rulesNode, _ := findFieldNode(contentNode, "rules"); rulesNode != nil {
@@ -889,7 +590,7 @@ func applyRulesRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 		}
 	}
 
-	// 如果没有找到映射，则将内容视为规则数组
+	// If not found as mapping, treat the content as rules array
 	if newRulesNode == nil {
 		if contentNode.Kind == yaml.SequenceNode {
 			newRulesNode = contentNode
@@ -898,14 +599,14 @@ func applyRulesRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 		}
 	}
 
-	// 获取现有规则节点
+	// Get existing rules node
 	existingRulesNode, idx := findFieldNode(docNode, "rules")
 
 	if rule.Mode == "replace" {
-		// 从现有规则中提取 RULE-SET 规则以保留它们
+		// Extract RULE-SET rules from existing rules to preserve them
 		ruleSetRules := extractRuleSetRules(existingRulesNode)
 
-		// 如果我们有 RULE-SET 规则，请将它们附加到新规则中
+		// If we have RULE-SET rules, append them to new rules
 		if len(ruleSetRules) > 0 && newRulesNode.Kind == yaml.SequenceNode {
 			combined := &yaml.Node{
 				Kind:    yaml.SequenceNode,
@@ -927,12 +628,12 @@ func applyRulesRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 		}
 	} else if rule.Mode == "prepend" {
 		if existingRulesNode == nil || existingRulesNode.Kind != yaml.SequenceNode {
-			// 没有现有规则，只需设置新规则
+			// No existing rules, just set the new ones
 			setFieldNode(docNode, "rules", newRulesNode)
 		} else {
-			// 通过重复数据删除将新规则添加到现有规则之前
+			// Prepend new rules to existing rules with deduplication
 			if newRulesNode.Kind == yaml.SequenceNode {
-				// 在添加之前从现有规则中删除重复项
+				// Remove duplicates from existing rules before prepending
 				filteredExisting := removeDuplicateNodesBasedOnNewRules(existingRulesNode.Content, newRulesNode.Content)
 
 				combined := &yaml.Node{
@@ -946,19 +647,35 @@ func applyRulesRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 		}
 	} else if rule.Mode == "append" {
 		if existingRulesNode == nil || existingRulesNode.Kind != yaml.SequenceNode {
-			// 没有现有规则，只需设置新规则
 			setFieldNode(docNode, "rules", newRulesNode)
 		} else {
-			// 通过重复数据删除将新规则附加到现有规则
 			if newRulesNode.Kind == yaml.SequenceNode {
-				// 在追加之前从现有规则中删除重复项
 				filteredExisting := removeDuplicateNodesBasedOnNewRules(existingRulesNode.Content, newRulesNode.Content)
+
+				// 找到 MATCH 规则的位置，将新规则插入到 MATCH 之前
+				matchIdx := -1
+				for i, node := range filteredExisting {
+					if node.Kind == yaml.ScalarNode && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(node.Value)), "MATCH,") {
+						matchIdx = i
+						break
+					}
+				}
+
+				var content []*yaml.Node
+				if matchIdx >= 0 {
+					content = make([]*yaml.Node, 0, len(filteredExisting)+len(newRulesNode.Content))
+					content = append(content, filteredExisting[:matchIdx]...)
+					content = append(content, newRulesNode.Content...)
+					content = append(content, filteredExisting[matchIdx:]...)
+				} else {
+					content = append(filteredExisting, newRulesNode.Content...)
+				}
 
 				combined := &yaml.Node{
 					Kind:    yaml.SequenceNode,
 					Style:   existingRulesNode.Style,
 					Tag:     existingRulesNode.Tag,
-					Content: append(filteredExisting, newRulesNode.Content...),
+					Content: content,
 				}
 				docNode.Content[idx] = combined
 			}
@@ -966,14 +683,14 @@ func applyRulesRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 	}
 }
 
-// 将规则提供程序应用到 YAML 节点
+// applyRuleProvidersRuleToNode applies rule-providers to the YAML node
 func applyRuleProvidersRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 	var parsedContent yaml.Node
 	if err := yaml.Unmarshal([]byte(rule.Content), &parsedContent); err != nil {
 		return
 	}
 
-	// 获取内容节点
+	// Get content node
 	var contentNode *yaml.Node
 	if parsedContent.Kind == yaml.DocumentNode && len(parsedContent.Content) > 0 {
 		contentNode = parsedContent.Content[0]
@@ -981,7 +698,7 @@ func applyRuleProvidersRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 		contentNode = &parsedContent
 	}
 
-	// 检查它是否包含“rule-providers:”键
+	// Check if it contains "rule-providers:" key
 	var newProvidersNode *yaml.Node
 	if contentNode.Kind == yaml.MappingNode {
 		if providersNode, _ := findFieldNode(contentNode, "rule-providers"); providersNode != nil {
@@ -993,14 +710,15 @@ func applyRuleProvidersRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 		return
 	}
 
+	// Get existing rule-providers node
 	existingProvidersNode, idx := findFieldNode(docNode, "rule-providers")
 
 	if rule.Mode == "replace" {
-		// 在替换模式下，将新提供程序与现有提供程序合并（新提供程序优先）
+		// In replace mode, merge new providers with existing ones (new providers take precedence)
 		if existingProvidersNode != nil && existingProvidersNode.Kind == yaml.MappingNode && newProvidersNode.Kind == yaml.MappingNode {
 			mergeMapNodes(existingProvidersNode, newProvidersNode)
 		} else {
-			// 没有现有的提供程序或类型错误，只需设置新的提供程序
+			// No existing providers or wrong type, just set the new ones
 			if idx >= 0 {
 				docNode.Content[idx] = newProvidersNode
 			} else {
@@ -1009,10 +727,10 @@ func applyRuleProvidersRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 		}
 	} else if rule.Mode == "prepend" {
 		if existingProvidersNode == nil || existingProvidersNode.Kind != yaml.MappingNode {
-			// 没有现有的提供商，只需设置新的提供商
+			// No existing providers, just set the new ones
 			setFieldNode(docNode, "rule-providers", newProvidersNode)
 		} else {
-			// 合并：新提供商优先
+			// Merge: new providers take precedence
 			if newProvidersNode.Kind == yaml.MappingNode {
 				mergeMapNodes(existingProvidersNode, newProvidersNode)
 			}
@@ -1020,23 +738,23 @@ func applyRuleProvidersRuleToNode(docNode *yaml.Node, rule storage.CustomRule) {
 	}
 }
 
-// 在映射节点中设置或添加字段
+// setFieldNode sets or adds a field in a mapping node
 func setFieldNode(mappingNode *yaml.Node, key string, valueNode *yaml.Node) {
 	if mappingNode.Kind != yaml.MappingNode {
 		return
 	}
 
-	// 检查密钥是否已经存在
+	// Check if key already exists
 	for i := 0; i < len(mappingNode.Content); i += 2 {
 		keyNode := mappingNode.Content[i]
 		if keyNode.Value == key {
-			// 替换值
+			// Replace value
 			mappingNode.Content[i+1] = valueNode
 			return
 		}
 	}
 
-	// 添加新的键值对
+	// Add new key-value pair
 	keyNode := &yaml.Node{
 		Kind:  yaml.ScalarNode,
 		Value: key,
@@ -1044,275 +762,33 @@ func setFieldNode(mappingNode *yaml.Node, key string, valueNode *yaml.Node) {
 	mappingNode.Content = append(mappingNode.Content, keyNode, valueNode)
 }
 
-// mergeMapNodes将newNode合并到existingNode中（新值优先）
+// mergeMapNodes merges newNode into existingNode (new values take precedence)
 func mergeMapNodes(existingNode *yaml.Node, newNode *yaml.Node) {
 	if existingNode.Kind != yaml.MappingNode || newNode.Kind != yaml.MappingNode {
 		return
 	}
 
-	// 迭代新节点的键值对
+	// Iterate through new node's key-value pairs
 	for i := 0; i < len(newNode.Content); i += 2 {
 		newKeyNode := newNode.Content[i]
 		newValueNode := newNode.Content[i+1]
 
-		// 查找现有节点中是否存在 key
+		// Find if key exists in existing node
 		found := false
 		for j := 0; j < len(existingNode.Content); j += 2 {
 			existingKeyNode := existingNode.Content[j]
 			if existingKeyNode.Value == newKeyNode.Value {
-				// 替换值
+				// Replace value
 				existingNode.Content[j+1] = newValueNode
 				found = true
 				break
 			}
 		}
 
-		// 如果没有找到，则追加
+		// If not found, append
 		if !found {
 			existingNode.Content = append(existingNode.Content, newKeyNode, newValueNode)
 		}
 	}
 }
 
-// 将 DNS 规则应用于 YAML 节点（用于自动同步的智能版本）
-func applyDNSRuleToNodeSmart(docNode *yaml.Node, rule storage.CustomRule, prevApp *storage.CustomRuleApplication, ctx context.Context, repo *storage.TrafficRepository, subscribeFileID int64, contentHash string) {
-	// DNS 规则总是替换，无需重复数据删除
-	applyDNSRuleToNode(docNode, rule)
-
-	// 记录申请
-	_ = recordApplication(ctx, repo, subscribeFileID, rule, "", contentHash)
-}
-
-// 将规则应用到具有重复数据删除功能的 YAML 节点（用于自动同步的智能版本）
-func applyRulesRuleToNodeSmart(docNode *yaml.Node, rule storage.CustomRule, prevApp *storage.CustomRuleApplication, ctx context.Context, repo *storage.TrafficRepository, subscribeFileID int64, contentHash string) {
-	var parsedContent yaml.Node
-	if err := yaml.Unmarshal([]byte(rule.Content), &parsedContent); err != nil {
-		return
-	}
-
-	// 获取内容节点
-	var contentNode *yaml.Node
-	if parsedContent.Kind == yaml.DocumentNode && len(parsedContent.Content) > 0 {
-		contentNode = parsedContent.Content[0]
-	} else {
-		contentNode = &parsedContent
-	}
-
-	// 检查它是否包含“rules:”键
-	var newRulesNode *yaml.Node
-	if contentNode.Kind == yaml.MappingNode {
-		if rulesNode, _ := findFieldNode(contentNode, "rules"); rulesNode != nil {
-			newRulesNode = rulesNode
-		}
-	}
-
-	// 如果没有找到映射，则将内容视为规则数组
-	if newRulesNode == nil {
-		if contentNode.Kind == yaml.SequenceNode {
-			newRulesNode = contentNode
-		} else {
-			return
-		}
-	}
-
-	// 获取现有规则节点
-	existingRulesNode, idx := findFieldNode(docNode, "rules")
-
-	if rule.Mode == "replace" {
-		// 从现有规则中提取 RULE-SET 规则以保留它们
-		ruleSetRules := extractRuleSetRules(existingRulesNode)
-
-		// 如果我们有 RULE-SET 规则，请将它们附加到新规则中
-		if len(ruleSetRules) > 0 && newRulesNode.Kind == yaml.SequenceNode {
-			combined := &yaml.Node{
-				Kind:    yaml.SequenceNode,
-				Style:   newRulesNode.Style,
-				Tag:     newRulesNode.Tag,
-				Content: append(newRulesNode.Content, ruleSetRules...),
-			}
-			if idx >= 0 {
-				docNode.Content[idx] = combined
-			} else {
-				setFieldNode(docNode, "rules", combined)
-			}
-		} else {
-			if idx >= 0 {
-				docNode.Content[idx] = newRulesNode
-			} else {
-				setFieldNode(docNode, "rules", newRulesNode)
-			}
-		}
-	} else if rule.Mode == "prepend" {
-		if existingRulesNode == nil || existingRulesNode.Kind != yaml.SequenceNode {
-			// 没有现有规则，只需设置新规则
-			setFieldNode(docNode, "rules", newRulesNode)
-		} else {
-			// 删除历史内容（如果存在）
-			if prevApp != nil && prevApp.AppliedContent != "" {
-				var historicalRules []interface{}
-				if err := json.Unmarshal([]byte(prevApp.AppliedContent), &historicalRules); err == nil {
-					existingRulesNode.Content = removeNodesFromSequence(existingRulesNode.Content, historicalRules)
-				}
-			}
-			// 通过重复数据删除将新规则添加到现有规则之前
-			if newRulesNode.Kind == yaml.SequenceNode {
-				// 在添加之前从现有规则中删除重复项
-				filteredExisting := removeDuplicateNodesBasedOnNewRules(existingRulesNode.Content, newRulesNode.Content)
-
-				combined := &yaml.Node{
-					Kind:    yaml.SequenceNode,
-					Style:   existingRulesNode.Style,
-					Tag:     existingRulesNode.Tag,
-					Content: append(newRulesNode.Content, filteredExisting...),
-				}
-				docNode.Content[idx] = combined
-			}
-		}
-	} else if rule.Mode == "append" {
-		if existingRulesNode == nil || existingRulesNode.Kind != yaml.SequenceNode {
-			// 没有现有规则，只需设置新规则
-			setFieldNode(docNode, "rules", newRulesNode)
-		} else {
-			// 删除历史内容（如果存在）
-			if prevApp != nil && prevApp.AppliedContent != "" {
-				var historicalRules []interface{}
-				if err := json.Unmarshal([]byte(prevApp.AppliedContent), &historicalRules); err == nil {
-					existingRulesNode.Content = removeNodesFromSequence(existingRulesNode.Content, historicalRules)
-				}
-			}
-			// 将新规则附加到现有规则
-			if newRulesNode.Kind == yaml.SequenceNode {
-				combined := &yaml.Node{
-					Kind:    yaml.SequenceNode,
-					Style:   existingRulesNode.Style,
-					Tag:     existingRulesNode.Tag,
-					Content: append(existingRulesNode.Content, newRulesNode.Content...),
-				}
-				docNode.Content[idx] = combined
-			}
-		}
-	}
-
-	// 序列化应用的内容以进行跟踪（将节点转换为 JSON 的接口{}）
-	var appliedRules []interface{}
-	for _, node := range newRulesNode.Content {
-		var val interface{}
-		if err := node.Decode(&val); err == nil {
-			appliedRules = append(appliedRules, val)
-		}
-	}
-	appliedJSON, _ := json.Marshal(appliedRules)
-	_ = recordApplication(ctx, repo, subscribeFileID, rule, string(appliedJSON), contentHash)
-}
-
-// 将规则提供程序应用到具有重复数据删除功能的 YAML 节点（用于自动同步的智能版本）
-func applyRuleProvidersRuleToNodeSmart(docNode *yaml.Node, rule storage.CustomRule, prevApp *storage.CustomRuleApplication, ctx context.Context, repo *storage.TrafficRepository, subscribeFileID int64, contentHash string) {
-	var parsedContent yaml.Node
-	if err := yaml.Unmarshal([]byte(rule.Content), &parsedContent); err != nil {
-		return
-	}
-
-	// 获取内容节点
-	var contentNode *yaml.Node
-	if parsedContent.Kind == yaml.DocumentNode && len(parsedContent.Content) > 0 {
-		contentNode = parsedContent.Content[0]
-	} else {
-		contentNode = &parsedContent
-	}
-
-	// 检查它是否包含“rule-providers:”键
-	var newProvidersNode *yaml.Node
-	if contentNode.Kind == yaml.MappingNode {
-		if providersNode, _ := findFieldNode(contentNode, "rule-providers"); providersNode != nil {
-			newProvidersNode = providersNode
-		} else {
-			newProvidersNode = contentNode
-		}
-	} else {
-		return
-	}
-
-	existingProvidersNode, idx := findFieldNode(docNode, "rule-providers")
-
-	if rule.Mode == "replace" {
-		if idx >= 0 {
-			docNode.Content[idx] = newProvidersNode
-		} else {
-			setFieldNode(docNode, "rule-providers", newProvidersNode)
-		}
-	} else if rule.Mode == "prepend" {
-		if existingProvidersNode == nil || existingProvidersNode.Kind != yaml.MappingNode {
-			// 没有现有的提供商，只需设置新的提供商
-			setFieldNode(docNode, "rule-providers", newProvidersNode)
-		} else {
-			// 删除历史提供程序（如果存在）
-			if prevApp != nil && prevApp.AppliedContent != "" {
-				var historicalProviders map[string]interface{}
-				if err := json.Unmarshal([]byte(prevApp.AppliedContent), &historicalProviders); err == nil {
-					removeKeysFromMapNode(existingProvidersNode, historicalProviders)
-				}
-			}
-			// 合并：新提供商优先
-			if newProvidersNode.Kind == yaml.MappingNode {
-				mergeMapNodes(existingProvidersNode, newProvidersNode)
-			}
-		}
-	}
-
-	// 序列化应用的内容以进行跟踪
-	var appliedProviders map[string]interface{}
-	if err := newProvidersNode.Decode(&appliedProviders); err == nil {
-		appliedJSON, _ := json.Marshal(appliedProviders)
-		_ = recordApplication(ctx, repo, subscribeFileID, rule, string(appliedJSON), contentHash)
-	}
-}
-
-// 从序列中删除与给定值匹配的节点
-func removeNodesFromSequence(nodes []*yaml.Node, toRemove []interface{}) []*yaml.Node {
-	// 构建一组要删除的值
-	removeSet := make(map[string]bool)
-	for _, val := range toRemove {
-		if str, ok := val.(string); ok {
-			removeSet[str] = true
-		}
-	}
-
-	// 过滤掉匹配的节点
-	var filtered []*yaml.Node
-	for _, node := range nodes {
-		var val interface{}
-		if err := node.Decode(&val); err == nil {
-			if str, ok := val.(string); ok {
-				if !removeSet[str] {
-					filtered = append(filtered, node)
-				}
-				continue
-			}
-		}
-		// 保留非字符串节点
-		filtered = append(filtered, node)
-	}
-	return filtered
-}
-
-// 从地图节点中删除键
-func removeKeysFromMapNode(mapNode *yaml.Node, keysToRemove map[string]interface{}) {
-	if mapNode.Kind != yaml.MappingNode {
-		return
-	}
-
-	// 创建一个新的内容切片，无需删除键
-	var newContent []*yaml.Node
-	for i := 0; i < len(mapNode.Content); i += 2 {
-		if i+1 < len(mapNode.Content) {
-			keyNode := mapNode.Content[i]
-			valueNode := mapNode.Content[i+1]
-
-			// 检查是否应删除此密钥
-			if _, shouldRemove := keysToRemove[keyNode.Value]; !shouldRemove {
-				newContent = append(newContent, keyNode, valueNode)
-			}
-		}
-	}
-	mapNode.Content = newContent
-}

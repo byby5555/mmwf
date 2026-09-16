@@ -8,16 +8,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"time"
 )
 
 // UserAPIToken 是每用户 API 令牌的元数据(不含明文/hash)。
-type UserAPIToken struct {
-	ID         int64      `json:"id"`
-	Name       string     `json:"name"`
-	CreatedAt  time.Time  `json:"created_at"`
-	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
-}
 
 // hashAPIToken 返回令牌的 sha256 十六进制串(库里只存这个)。
 func hashAPIToken(token string) string {

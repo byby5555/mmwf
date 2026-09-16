@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"miaomiaowux/internal/logger"
 	"miaomiaowux/internal/storage"
 	"miaomiaowux/templates"
 )
@@ -325,7 +326,128 @@ func (h *CertificateHandler) EnableHTTPS(w http.ResponseWriter, r *http.Request)
 	go func() {
 		time.Sleep(2 * time.Second)
 		log.Printf("[EnableHTTPS] Restarting service to bind 127.0.0.1 only")
-		p, _ := os.FindProcess(os.Getpid())
-		_ = p.Signal(syscall.SIGTERM)
+	p, _ := os.FindProcess(os.Getpid())
+	_ = p.Signal(syscall.SIGTERM)
 	}()
+}
+
+// deployLocalNginx 在本机部署单个域名的 nginx 反代配置(无 TLS)。
+// 用于创建 remote_server 时若发现请求的域名解析到本机 IP,自动配好 nginx 指向主控后端。
+func deployLocalNginx(domain string, repo *storage.TrafficRepository) error {
+	nginxConf, err := templates.ReadFile("single_nginx.conf")
+	if err != nil {
+		return fmt.Errorf("读取 single_nginx.conf 模板失败: %w", err)
+	}
+
+	domainTpl, err := templates.ReadFile("mmwx_domain.conf")
+	if err != nil {
+		return fmt.Errorf("读取 mmwx_domain.conf 模板失败: %w", err)
+	}
+	domainConf := strings.ReplaceAll(string(domainTpl), "{domain}", domain)
+
+	dirs := []string{
+		"/usr/local/nginx/conf",
+		"/usr/local/nginx/servers",
+		"/usr/local/nginx/cert",
+		"/usr/local/nginx/html",
+	}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("创建目录 %s 失败: %w", dir, err)
+		}
+	}
+
+	if err := os.WriteFile("/usr/local/nginx/nginx.conf", nginxConf, 0644); err != nil {
+		return fmt.Errorf("写入 nginx.conf 失败: %w", err)
+	}
+
+	serverConfPath := filepath.Join("/usr/local/nginx/servers", domain+".conf")
+	if err := os.WriteFile(serverConfPath, []byte(domainConf), 0644); err != nil {
+		return fmt.Errorf("写入 domain.conf 失败: %w", err)
+	}
+
+	if repo != nil {
+		deployCertToLocal(domain, repo)
+	}
+
+	nginxBin := findNginxBinary()
+	if nginxBin == "" {
+		return fmt.Errorf("未找到 nginx 可执行文件")
+	}
+	if err := ensureNginxRunning(nginxBin); err != nil {
+		return fmt.Errorf("nginx 启动失败: %w", err)
+	}
+
+	if !isDocker() {
+		if err := exec.Command("systemctl", "enable", "nginx").Run(); err != nil {
+			logger.Warn("[本机Nginx] systemctl enable nginx 失败 (开机自启未设置)", "error", err)
+		}
+	}
+	return nil
+}
+
+// deployLocalNginxWithCert 在本机部署带 TLS 证书的 nginx 反代配置。
+func deployLocalNginxWithCert(domain string, cert *storage.Certificate) error {
+	nginxConf, err := templates.ReadFile("single_nginx.conf")
+	if err != nil {
+		return fmt.Errorf("读取 single_nginx.conf 模板失败: %w", err)
+	}
+	domainTpl, err := templates.ReadFile("mmwx_domain.conf")
+	if err != nil {
+		return fmt.Errorf("读取 mmwx_domain.conf 模板失败: %w", err)
+	}
+	certName := domain
+	if cert != nil {
+		certName = certDeployFilename(cert.Domain)
+	}
+	domainConf := strings.ReplaceAll(string(domainTpl), "{domain}", domain)
+	domainConf = strings.ReplaceAll(domainConf, "{cert_name}", certName)
+
+	dirs := []string{"/usr/local/nginx/conf", "/usr/local/nginx/servers", "/usr/local/nginx/cert", "/usr/local/nginx/html"}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("创建目录 %s 失败: %w", dir, err)
+		}
+	}
+	if err := os.WriteFile("/usr/local/nginx/nginx.conf", nginxConf, 0644); err != nil {
+		return fmt.Errorf("写入 nginx.conf 失败: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join("/usr/local/nginx/servers", domain+".conf"), []byte(domainConf), 0644); err != nil {
+		return fmt.Errorf("写入 domain.conf 失败: %w", err)
+	}
+	if cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
+		if err := os.WriteFile(filepath.Join("/usr/local/nginx/cert", certName+".pem"), []byte(cert.CertPEM), 0644); err != nil {
+			return fmt.Errorf("写入证书失败: %w", err)
+		}
+		if err := os.WriteFile(filepath.Join("/usr/local/nginx/cert", certName+".key"), []byte(cert.KeyPEM), 0600); err != nil {
+			return fmt.Errorf("写入密钥失败: %w", err)
+		}
+	}
+	nginxBin := findNginxBinary()
+	if nginxBin == "" {
+		return fmt.Errorf("未找到 nginx 可执行文件")
+	}
+	return ensureNginxRunning(nginxBin)
+}
+
+// deployCertToLocal 将已签发证书写入本机 nginx cert 目录。
+func deployCertToLocal(domain string, repo *storage.TrafficRepository) {
+	ctx := context.Background()
+	cert, err := repo.GetCertificateByDomain(ctx, domain, 0)
+	if err != nil || cert == nil || cert.CertPEM == "" || cert.KeyPEM == "" {
+		logger.Warn("[本机Nginx] 未找到域名证书，跳过证书部署", "domain", domain)
+		return
+	}
+	certFilename := certDeployFilename(cert.Domain)
+	certPath := filepath.Join("/usr/local/nginx/cert", certFilename+".pem")
+	keyPath := filepath.Join("/usr/local/nginx/cert", certFilename+".key")
+	if err := os.WriteFile(certPath, []byte(cert.CertPEM), 0644); err != nil {
+		logger.Error("[本机Nginx] 写入证书失败", "error", err)
+		return
+	}
+	if err := os.WriteFile(keyPath, []byte(cert.KeyPEM), 0600); err != nil {
+		logger.Error("[本机Nginx] 写入密钥失败", "error", err)
+		return
+	}
+	logger.Info("[本机Nginx] 证书部署成功", "domain", domain)
 }

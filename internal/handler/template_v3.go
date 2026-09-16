@@ -8,10 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/logger"
-	"miaomiaowux/internal/storage"
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
+	"miaomiaowux/internal/auth"
+	"miaomiaowux/internal/storage"
 
 	"gopkg.in/yaml.v3"
 )
@@ -213,17 +212,17 @@ func (h *TemplateV3Handler) handlePreviewWithTags(w http.ResponseWriter, r *http
 		sortNodesByNodeOrder(nodes, settings.NodeOrder)
 	}
 
-	// 构建节点 ID -> 名称映射（用于链式代理解析）
-	nodeIDToName := make(map[int64]string, len(nodes))
-	for _, node := range nodes {
-		nodeIDToName[node.ID] = node.NodeName
-	}
-
 	// Filter nodes by selected tags and enabled status
 	var proxies []map[string]any
 	selectedTagsSet := make(map[string]bool)
 	for _, tag := range req.SelectedTags {
 		selectedTagsSet[tag] = true
+	}
+
+	// 构建节点 ID -> 名称映射（用于链式代理解析）
+	nodeIDToName := make(map[int64]string, len(nodes))
+	for _, node := range nodes {
+		nodeIDToName[node.ID] = node.NodeName
 	}
 
 	for _, node := range nodes {
@@ -266,13 +265,17 @@ func (h *TemplateV3Handler) handlePreviewWithTags(w http.ResponseWriter, r *http
 	})
 }
 
-// processV3Template processes a v3 template with the given proxies.
-// Surge 模板(内容含 [Proxy Group]/[General] 段头)走 Surge 注入,其余按 Clash YAML 处理。
+// processV3Template processes a v3 template with the given proxies
 func (h *TemplateV3Handler) processV3Template(templateContent string, proxies []map[string]any) (string, error) {
+	// Loon 判断必须在 Surge 之前:两者段头几乎一样([General]/[Proxy]/[Proxy Group]/[Rule]
+	// 都有),looksLikeSurgeTemplate 对 Loon 模板会全部命中,于是按 Surge 的节点行格式注入,
+	// 产出一份 Loon 读不了的配置。
+	if looksLikeLoonTemplate(templateContent) {
+		return injectProxiesIntoLoonTemplate(templateContent, proxies)
+	}
 	if looksLikeSurgeTemplate(templateContent) {
 		return injectProxiesIntoSurgeTemplate(templateContent, proxies)
 	}
-
 	// Create processor with empty providers (v3 doesn't use external providers)
 	processor := substore.NewTemplateV3Processor(nil, nil)
 
@@ -291,19 +294,89 @@ func (h *TemplateV3Handler) processV3Template(templateContent string, proxies []
 	return result, nil
 }
 
-// looksLikeSurgeTemplate 通过 Surge 特有的段头判断内容是否为 Surge 配置(预览按内容判断时用)。
 func looksLikeSurgeTemplate(content string) bool {
 	for _, line := range strings.Split(content, "\n") {
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case strings.EqualFold(trimmed, "[General]"),
-			strings.EqualFold(trimmed, "[Proxy Group]"),
-			strings.EqualFold(trimmed, "[Proxy]"),
-			strings.EqualFold(trimmed, "[Rule]"):
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "[general]", "[proxy]", "[proxy group]", "[rule]":
 			return true
 		}
 	}
 	return false
+}
+
+// looksLikeLoonTemplate 只认 Loon 独有的段头 —— Surge 没有这几个段,用它们把 Loon 和
+// Surge 区分开(两者的 [General]/[Proxy]/[Rule] 段头是一样的,不能作数)。
+func looksLikeLoonTemplate(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.EqualFold(trimmed, "[Remote Rule]"), // Surge 用 [Rule] 里的 RULE-SET
+			strings.EqualFold(trimmed, "[Proxy Chain]"), // Surge 没有这个段
+			strings.EqualFold(trimmed, "[Plugin]"):      // Surge 用 [Script]
+			return true
+		}
+	}
+	return false
+}
+
+func isSurgeTemplateFile(filename string) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(filename)), ".conf")
+}
+
+func isSurgeClientType(clientType string) bool {
+	switch strings.ToLower(strings.TrimSpace(clientType)) {
+	case "surge", "surgemac", "clash-to-surge":
+		return true
+	default:
+		return false
+	}
+}
+
+func injectProxiesIntoSurgeTemplate(templateContent string, proxies []map[string]any) (string, error) {
+	items := make([]substore.Proxy, 0, len(proxies))
+	for _, proxy := range proxies {
+		items = append(items, substore.Proxy(proxy))
+	}
+	produced, err := substore.NewSurgeProducer().Produce(items, "", &substore.ProduceOptions{})
+	if err != nil {
+		return "", err
+	}
+	proxyLines, ok := produced.(string)
+	if !ok {
+		return "", fmt.Errorf("unexpected Surge producer result type: %T", produced)
+	}
+	proxyLines = strings.TrimRight(proxyLines, "\n")
+	lines := strings.Split(templateContent, "\n")
+	out := make([]string, 0, len(lines)+len(items))
+	inProxy, injected := false, false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			inProxy = strings.EqualFold(trimmed, "[Proxy]")
+			out = append(out, line)
+			if inProxy {
+				if proxyLines != "" {
+					out = append(out, proxyLines)
+				}
+				injected = true
+			}
+			continue
+		}
+		if inProxy {
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				out = append(out, line)
+			}
+			continue
+		}
+		out = append(out, line)
+	}
+	if !injected {
+		out = append(out, "", "[Proxy]")
+		if proxyLines != "" {
+			out = append(out, proxyLines)
+		}
+	}
+	return strings.Join(out, "\n"), nil
 }
 
 // injectProxiesIntoTemplate injects proxy nodes into the template's proxies section
@@ -355,6 +428,41 @@ func injectProxiesIntoTemplate(templateContent string, proxies []map[string]any)
 	// Post-process to remove quotes from emoji strings and convert Unicode escapes
 	result := RemoveUnicodeEscapeQuotes(buf.String())
 	return result, nil
+}
+
+func injectRelayGroupsIntoTemplate(templateContent string, relayGroups []map[string]any) (string, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(templateContent), &root); err != nil {
+		return templateContent, err
+	}
+	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
+		return templateContent, nil
+	}
+	rootMap := root.Content[0]
+	if rootMap.Kind != yaml.MappingNode {
+		return templateContent, nil
+	}
+
+	for i := 0; i < len(rootMap.Content); i += 2 {
+		if rootMap.Content[i].Value == "proxy-groups" {
+			groupsNode := rootMap.Content[i+1]
+			if groupsNode.Kind == yaml.SequenceNode {
+				for _, rg := range relayGroups {
+					groupsNode.Content = append(groupsNode.Content, mapToYAMLNode(rg))
+				}
+			}
+			break
+		}
+	}
+
+	var buf strings.Builder
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&root); err != nil {
+		return templateContent, err
+	}
+	encoder.Close()
+	return RemoveUnicodeEscapeQuotes(buf.String()), nil
 }
 
 // mapToYAMLNode converts a map to a YAML mapping node
@@ -440,6 +548,17 @@ func anyToYAMLNode(v any) *yaml.Node {
 			Value: boolToString(val),
 		}
 	case []any:
+		seqNode := &yaml.Node{
+			Kind: yaml.SequenceNode,
+			Tag:  "!!seq",
+		}
+		for _, item := range val {
+			seqNode.Content = append(seqNode.Content, anyToYAMLNode(item))
+		}
+		return seqNode
+	case []string:
+		// 中转组 proxies 等以 []string 传入，需序列化为 YAML 序列
+		// （否则会落到 default 分支被渲染成空字符串，导致中转组成员丢失）
 		seqNode := &yaml.Node{
 			Kind: yaml.SequenceNode,
 			Tag:  "!!seq",
@@ -593,12 +712,39 @@ func (h *TemplateV3Handler) handleAnalyzeSubscription(w http.ResponseWriter, r *
 
 	// Generate V3 template
 	templateContent := substore.GenerateV3TemplateFromAnalysis(result)
+	templateContent, err = appendRuleProvidersToTemplate(templateContent, result.RuleProviders)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "生成模板失败: "+err.Error())
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"analysis":         result,
 		"template_content": templateContent,
 	})
+}
+
+// appendRuleProvidersToTemplate preserves providers discovered by the analyzer
+// when the template generator does not emit them itself.
+func appendRuleProvidersToTemplate(templateContent string, providers map[string]any) (string, error) {
+	if len(providers) == 0 {
+		return templateContent, nil
+	}
+
+	var generated map[string]any
+	if err := yaml.Unmarshal([]byte(templateContent), &generated); err != nil {
+		return "", err
+	}
+	if _, exists := generated["rule-providers"]; exists {
+		return templateContent, nil
+	}
+
+	providerYAML, err := yaml.Marshal(map[string]any{"rule-providers": providers})
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(templateContent, "\n") + "\n\n" + string(providerYAML), nil
 }
 
 // handleGetRegionFilters returns the available region filters
@@ -622,10 +768,10 @@ func (h *TemplateV3Handler) handleListTemplates(w http.ResponseWriter, r *http.R
 	}
 
 	type templateInfo struct {
-		Name      string            `json:"name"`                // 显示名称（去掉 _v3.yaml 后缀）
-		Filename  string            `json:"filename"`            // 完整文件名
-		Type      string            `json:"type"`                // "clash"(.yaml/.yml) 或 "surge"(.conf)
-		Variables map[string]string `json:"variables,omitempty"` // 模板自定义变量(仅 Clash)
+		Name      string            `json:"name"`     // 显示名称（去掉 _v3.yaml 后缀）
+		Filename  string            `json:"filename"` // 完整文件名
+		Type      string            `json:"type"`
+		Variables map[string]string `json:"variables,omitempty"` // 模板自定义变量
 	}
 
 	var templates []templateInfo
@@ -634,132 +780,43 @@ func (h *TemplateV3Handler) handleListTemplates(w http.ResponseWriter, r *http.R
 			continue
 		}
 		name := entry.Name()
-		isClash := strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml")
-		isSurge := strings.HasSuffix(name, ".conf")
-		if !isClash && !isSurge {
-			continue
+		isSurge := isSurgeTemplateFile(name)
+		isLoon := isLoonTemplateFile(name)
+		if strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml") || isSurge || isLoon {
+			displayName := strings.TrimSuffix(name, ".yaml")
+			displayName = strings.TrimSuffix(displayName, ".yml")
+			displayName = strings.TrimSuffix(displayName, ".conf")
+			displayName = strings.TrimSuffix(displayName, ".lcf")
+			displayName = strings.TrimSuffix(displayName, "_v3")
+			displayName = strings.TrimSuffix(displayName, "__v3")
+			displayName = strings.ReplaceAll(displayName, "_", " ")
+
+			// 提取模板自定义变量(仅 clash 模板走 v3 变量系统;surge/loon 是纯文本段落)
+			var variables map[string]string
+			if !isSurge && !isLoon {
+				content, err := os.ReadFile(filepath.Join(templatesDir, name))
+				if err == nil {
+					variables = substore.ExtractTemplateVariables(string(content))
+				}
+			}
+			templateType := "clash"
+			if isSurge {
+				templateType = "surge"
+			} else if isLoon {
+				templateType = "loon"
+			}
+
+			templates = append(templates, templateInfo{
+				Name:      displayName,
+				Filename:  name,
+				Type:      templateType,
+				Variables: variables,
+			})
 		}
-
-		displayName := strings.TrimSuffix(name, ".yaml")
-		displayName = strings.TrimSuffix(displayName, ".yml")
-		displayName = strings.TrimSuffix(displayName, ".conf")
-		displayName = strings.TrimSuffix(displayName, "_v3")
-		displayName = strings.TrimSuffix(displayName, "__v3")
-		displayName = strings.TrimSuffix(displayName, "_surge")
-		displayName = strings.TrimSuffix(displayName, "__surge")
-		displayName = strings.ReplaceAll(displayName, "_", " ")
-
-		tmplType := "clash"
-		var variables map[string]string
-		if isSurge {
-			tmplType = "surge"
-		} else if content, err := os.ReadFile(filepath.Join(templatesDir, name)); err == nil {
-			// 仅 Clash 模板提取 YAML 自定义变量
-			variables = substore.ExtractTemplateVariables(string(content))
-		}
-
-		templates = append(templates, templateInfo{
-			Name:      displayName,
-			Filename:  name,
-			Type:      tmplType,
-			Variables: variables,
-		})
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"templates": templates,
 	})
-}
-
-// isSurgeTemplateFile 判断模板文件是否为 Surge 格式(.conf 扩展名)。
-func isSurgeTemplateFile(filename string) bool {
-	return strings.HasSuffix(strings.ToLower(filename), ".conf")
-}
-
-// isSurgeClientType 判断订阅请求的 ?t= 客户端类型是否属于 Surge 系
-// (走 Surge 文本输出、可套用 Surge 默认模板)。
-func isSurgeClientType(clientType string) bool {
-	switch strings.ToLower(strings.TrimSpace(clientType)) {
-	case "surge", "surgemac", "clash-to-surge":
-		return true
-	}
-	return false
-}
-
-// injectProxiesIntoSurgeTemplate 把节点列表序列化为 Surge [Proxy] 段的节点行,
-// 注入到模板 [Proxy] 段中(替换段内已有的非注释行,保留注释与其它段落原样)。
-// 地区分组靠模板里的 policy-regex-filter + include-all-proxies=1 从这些节点里筛选,
-// 因此这里只负责把节点写进 [Proxy] 段,不处理策略组展开。
-func injectProxiesIntoSurgeTemplate(templateContent string, proxies []map[string]any) (string, error) {
-	surgeProxies := make([]substore.Proxy, 0, len(proxies))
-	for _, p := range proxies {
-		surgeProxies = append(surgeProxies, substore.Proxy(p))
-	}
-
-	producer := substore.NewSurgeProducer()
-	produced, err := producer.Produce(surgeProxies, "", &substore.ProduceOptions{})
-	if err != nil {
-		return "", err
-	}
-	proxyLines, ok := produced.(string)
-	if !ok {
-		return "", fmt.Errorf("unexpected surge producer result type: %T", produced)
-	}
-	proxyLines = strings.TrimRight(proxyLines, "\n")
-
-	// Produce 会静默丢弃 Surge 不支持的节点类型(内部对失败节点 continue)。
-	// 这里逐个 ProduceOne 探测一遍,把被过滤的节点名+类型打进日志,方便排查
-	// "为什么订阅里少了几个节点"。仅用于日志,实际输出仍以上面 Produce 结果为准。
-	var filtered []string
-	for _, p := range surgeProxies {
-		if _, perr := producer.ProduceOne(p, "", &substore.ProduceOptions{}); perr != nil {
-			name, _ := p["name"].(string)
-			typ, _ := p["type"].(string)
-			filtered = append(filtered, fmt.Sprintf("%s(%s)", name, typ))
-		}
-	}
-	if len(filtered) > 0 {
-		logger.Info("[Surge模板] 部分节点因类型不受 Surge 支持被过滤",
-			"filtered_count", len(filtered), "total", len(surgeProxies), "nodes", strings.Join(filtered, ", "))
-	}
-
-	lines := strings.Split(templateContent, "\n")
-	var out []string
-	inProxySection := false
-	injected := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		// 段落头:[Xxx]
-		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			inProxySection = strings.EqualFold(trimmed, "[Proxy]")
-			out = append(out, line)
-			if inProxySection {
-				// 进入 [Proxy] 段:先写入节点行,随后跳过段内原有的非注释内容
-				if proxyLines != "" {
-					out = append(out, proxyLines)
-				}
-				injected = true
-			}
-			continue
-		}
-		if inProxySection {
-			// 段内保留注释(占位说明),丢弃其它内容(避免残留占位节点)
-			if strings.HasPrefix(trimmed, "#") || trimmed == "" {
-				out = append(out, line)
-			}
-			continue
-		}
-		out = append(out, line)
-	}
-
-	// 模板里没有 [Proxy] 段:追加一个
-	if !injected {
-		out = append(out, "", "[Proxy]")
-		if proxyLines != "" {
-			out = append(out, proxyLines)
-		}
-	}
-
-	return strings.Join(out, "\n"), nil
 }

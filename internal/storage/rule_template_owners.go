@@ -11,9 +11,15 @@ func (r *TrafficRepository) ensureRuleTemplateOwnersTable(ctx context.Context) e
 	}
 	_, err := r.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS rule_template_owners (
 		filename TEXT PRIMARY KEY,
-		created_by TEXT NOT NULL DEFAULT ''
+		created_by TEXT NOT NULL DEFAULT '',
+		is_public INTEGER NOT NULL DEFAULT 0
 	)`)
-	return err
+	if err != nil {
+		return err
+	}
+	// 迁移：给老表加 is_public 列
+	r.db.ExecContext(ctx, `ALTER TABLE rule_template_owners ADD COLUMN is_public INTEGER NOT NULL DEFAULT 0`)
+	return nil
 }
 
 // SetRuleTemplateOwner 记录/更新模板文件归属。
@@ -93,4 +99,32 @@ func (r *TrafficRepository) ListRuleTemplateOwners(ctx context.Context) (map[str
 		result[f] = c
 	}
 	return result, rows.Err()
+}
+
+// IsRuleTemplatePublic 返回模板是否公开。
+func (r *TrafficRepository) IsRuleTemplatePublic(ctx context.Context, filename string) bool {
+	if r == nil || r.db == nil {
+		return false
+	}
+	if err := r.ensureRuleTemplateOwnersTable(ctx); err != nil {
+		return false
+	}
+	var value int
+	return r.db.QueryRowContext(ctx, `SELECT is_public FROM rule_template_owners WHERE filename = ?`, filename).Scan(&value) == nil && value != 0
+}
+
+// SetRuleTemplatePublic 设置模板公开状态。
+func (r *TrafficRepository) SetRuleTemplatePublic(ctx context.Context, filename string, isPublic bool) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	if err := r.ensureRuleTemplateOwnersTable(ctx); err != nil {
+		return err
+	}
+	value := 0
+	if isPublic {
+		value = 1
+	}
+	_, err := r.db.ExecContext(ctx, `UPDATE rule_template_owners SET is_public = ? WHERE filename = ?`, value, filename)
+	return err
 }

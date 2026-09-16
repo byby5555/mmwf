@@ -3,7 +3,6 @@ package handler
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,10 +16,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 	"miaomiaowux/internal/auth"
+	"miaomiaowux/internal/notify"
 	"miaomiaowux/internal/scriptengine"
 	"miaomiaowux/internal/storage"
-	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 
 	"gopkg.in/yaml.v3"
 )
@@ -34,18 +34,18 @@ dns:
   enhanced-mode: fake-ip
   ipv6: true
   nameserver:
-    - https://120.53.53.53/dns-query
+    - https://doh.pub/dns-query
     - https://dns.alidns.com/dns-query
   nameserver-policy:
     geosite:cn,private:
-      - https://120.53.53.53/dns-query
+      - https://doh.pub/dns-query
       - https://dns.alidns.com/dns-query
     geosite:geolocation-!cn:
       - https://dns.cloudflare.com/dns-query
-      - https://8.8.8.8/dns-query
+      - https://dns.google/dns-query
   proxy-server-nameserver:
-    - https://120.53.53.53/dns-query
-    - https://223.5.5.5/dns-query
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
   respect-rules: true
 geo-auto-update: true
 geo-update-interval: 24
@@ -85,12 +85,13 @@ socks-port: 7891
 
 const tokenInvalidFilename = "token_invalid.yaml"
 
-// 令牌无效标志的上下文键
+// Context key for token invalid flag
 type ContextKey string
 
 const TokenInvalidKey ContextKey = "token_invalid"
 
 type SubscriptionHandler struct {
+	summary  *TrafficSummaryHandler
 	repo     *storage.TrafficRepository
 	baseDir  string
 	fallback string
@@ -107,20 +108,22 @@ func NewSubscriptionHandler(repo *storage.TrafficRepository, baseDir string) htt
 		panic("subscription handler requires repository")
 	}
 
-	return newSubscriptionHandler(repo, baseDir, subscriptionDefaultType)
+	summary := NewTrafficSummaryHandler(repo)
+	return newSubscriptionHandler(summary, repo, baseDir, subscriptionDefaultType)
 }
 
-// NewSubscriptionHandlerConcrete 创建订阅处理程序并返回具体类型。
-// 当其他处理程序需要直接访问 SubscriptionHandler 时使用此方法。
+// NewSubscriptionHandlerConcrete creates a subscription handler and returns the concrete type.
+// This is used when other handlers need direct access to the SubscriptionHandler.
 func NewSubscriptionHandlerConcrete(repo *storage.TrafficRepository, baseDir string) *SubscriptionHandler {
 	if repo == nil {
 		panic("subscription handler requires repository")
 	}
 
-	return newSubscriptionHandler(repo, baseDir, subscriptionDefaultType)
+	summary := NewTrafficSummaryHandler(repo)
+	return newSubscriptionHandler(summary, repo, baseDir, subscriptionDefaultType)
 }
 
-// 返回一个提供订阅文件的处理程序，允许通过查询参数使用会话令牌或用户令牌。
+// NewSubscriptionEndpoint returns a handler that serves subscription files, allowing either session tokens or user tokens via query parameter.
 func NewSubscriptionEndpoint(tokens *auth.TokenStore, repo *storage.TrafficRepository, baseDir string) http.Handler {
 	if tokens == nil {
 		panic("subscription endpoint requires token store")
@@ -129,11 +132,18 @@ func NewSubscriptionEndpoint(tokens *auth.TokenStore, repo *storage.TrafficRepos
 		panic("subscription endpoint requires repository")
 	}
 
-	inner := newSubscriptionHandler(repo, baseDir, subscriptionDefaultType)
+	inner := newSubscriptionHandler(nil, repo, baseDir, subscriptionDefaultType)
 	return &subscriptionEndpoint{tokens: tokens, repo: repo, inner: inner}
 }
 
-func newSubscriptionHandler(repo *storage.TrafficRepository, baseDir, fallback string) *SubscriptionHandler {
+func newSubscriptionHandler(summary *TrafficSummaryHandler, repo *storage.TrafficRepository, baseDir, fallback string) *SubscriptionHandler {
+	if summary == nil {
+		if repo == nil {
+			panic("subscription handler requires repository")
+		}
+		summary = NewTrafficSummaryHandler(repo)
+	}
+
 	if repo == nil {
 		panic("subscription handler requires repository")
 	}
@@ -147,10 +157,15 @@ func newSubscriptionHandler(repo *storage.TrafficRepository, baseDir, fallback s
 		fallback = subscriptionDefaultType
 	}
 
-	return &SubscriptionHandler{repo: repo, baseDir: cleanedBase, fallback: fallback}
+	return &SubscriptionHandler{summary: summary, repo: repo, baseDir: cleanedBase, fallback: fallback}
 }
 
 func (s *subscriptionEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if bfp := GetBruteForceProtector(); bfp != nil && bfp.IsBlocked(GetClientIP(r), r.URL.Path) {
+		http.NotFound(w, r)
+		return
+	}
+
 	request, ok := s.authorizeRequest(w, r)
 	if !ok {
 		return
@@ -161,16 +176,14 @@ func (s *subscriptionEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 func (s *subscriptionEndpoint) authorizeRequest(w http.ResponseWriter, r *http.Request) (*http.Request, bool) {
 	if r.Method != http.MethodGet {
-		// 允许处理程序以方法限制进行响应
+		// allow handler to respond with method restrictions
 		return r, true
 	}
 
-	// 严重安全:之前这里信任 ?username=XXX query 参数注入 username 到 context,
-	// 任何人都可以构造 `?filename=X&username=admin` 直接绕过 token 拿别人订阅(IDOR/未授权)。
-	// 实际短链接处理是用 r.Clone(ContextWithUsername(ctx, x)) 写入 **context**,
-	// 不需要也不应该信任 URL query。**移除此分支**,所有未携带有效 token/session 的访问都走 invalid 响应。
+	// username parameter is only trusted when injected internally (e.g. short link handler sets context directly).
+	// Never trust username from external query string — skip it here.
 
-	// 检查令牌参数（旧版/直接访问）
+	// Check for token parameter (legacy/direct access)
 	queryToken := strings.TrimSpace(r.URL.Query().Get("token"))
 	if queryToken != "" && s.repo != nil {
 		username, err := s.repo.ValidateUserToken(r.Context(), queryToken)
@@ -184,7 +197,7 @@ func (s *subscriptionEndpoint) authorizeRequest(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	// 检查标头令牌（基于会话的访问）
+	// Check for header token (session-based access)
 	headerToken := strings.TrimSpace(r.Header.Get(auth.AuthHeader))
 	username, ok := s.tokens.Lookup(headerToken)
 	if ok {
@@ -193,11 +206,17 @@ func (s *subscriptionEndpoint) authorizeRequest(w http.ResponseWriter, r *http.R
 	}
 
 	// 所有认证方式都失败，设置token失效标记
+	if bfp := GetBruteForceProtector(); bfp != nil {
+		bfp.RecordFailure(GetClientIP(r), r.URL.Path)
+	}
 	ctx := context.WithValue(r.Context(), TokenInvalidKey, true)
 	return r.WithContext(ctx), true
 }
 
 func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if rejectBlockedSubscriptionUA(w, r) {
+		return
+	}
 	// 性能监测：记录总开始时间
 	requestStart := time.Now()
 	var stepStart time.Time
@@ -213,47 +232,29 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 从上下文中获取用户名
+	// Get username from context
 	username := auth.UsernameFromContext(r.Context())
 
+	// 文件查找
+	stepStart = time.Now()
 	filename := strings.TrimSpace(r.URL.Query().Get("filename"))
 	var subscribeFile storage.SubscribeFile
 	var displayName string
 	var err error
 	var hasSubscribeFile bool
-	_ = hasSubscribeFile
 
 	if filename != "" {
 		subscribeFile, err = h.repo.GetSubscribeFileByFilename(r.Context(), filename)
 		if err != nil {
 			if errors.Is(err, storage.ErrSubscribeFileNotFound) {
+				if bfp := GetBruteForceProtector(); bfp != nil {
+					bfp.RecordFailure(GetClientIP(r), r.URL.Path)
+				}
 				writeError(w, http.StatusNotFound, errors.New("not found"))
 				return
 			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
-		}
-		// 越权防护:token 认证路径下,用户只能访问"自己创建的"或"管理员分配给自己的"订阅文件。
-		// 短链接路径(/x/{code})不会走到这里 — 它由 short_link.go 解析后直接转发 + 注入 created_by,
-		// 链接本身就是身份证明(谁拿到 code 谁访问),所以那条路径无需此校验。
-		// 此校验仅针对 token 认证 + filename 参数的入口,堵住 IDOR(改 filename 拿别人订阅)。
-		if username != "" {
-			user, uerr := h.repo.GetUser(r.Context(), username)
-			if uerr == nil && user.Role != storage.RoleAdmin && subscribeFile.CreatedBy != username {
-				allowed := false
-				if ids, ierr := h.repo.GetUserSubscriptionIDs(r.Context(), username); ierr == nil {
-					for _, id := range ids {
-						if id == subscribeFile.ID {
-							allowed = true
-							break
-						}
-					}
-				}
-				if !allowed {
-					writeError(w, http.StatusForbidden, errors.New("forbidden: subscription not assigned to user"))
-					return
-				}
-			}
 		}
 		displayName = subscribeFile.Name
 		hasSubscribeFile = true
@@ -264,6 +265,9 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		link, err := h.resolveSubscription(r.Context(), legacyName)
 		if err != nil {
 			if errors.Is(err, storage.ErrSubscriptionNotFound) {
+				if bfp := GetBruteForceProtector(); bfp != nil {
+					bfp.RecordFailure(GetClientIP(r), r.URL.Path)
+				}
 				writeError(w, http.StatusNotFound, err)
 				return
 			}
@@ -284,14 +288,15 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	logger.Info("[⏱️ 耗时监测] 文件查找完成", "step", "file_lookup", "duration_ms", time.Since(stepStart).Milliseconds(), "filename", filename)
 
-	if username != "" {
-		clientType := r.Header.Get("User-Agent")
-		if clientType == "" {
-			clientType = "unknown"
-		}
-		SendSubscribeFetchNotification(r.Context(), username, clientType, GetClientIP(r))
-		if silentMgr := GetSilentModeManager(); silentMgr != nil && username != "" {
-			silentMgr.RecordSubscriptionAccessWithIP(username, GetClientIP(r))
+	// 权限校验：验证用户是否有权访问该订阅文件
+	if username != "" && hasSubscribeFile && h.repo != nil {
+		hasAccess, err := h.repo.UserHasAccessToSubscribeFile(r.Context(), username, subscribeFile.ID)
+		if err != nil {
+			logger.Info("[Security] 权限校验失败", "username", username, "filename", filename, "error", err)
+		} else if !hasAccess {
+			logger.Info("[Security] 用户无权访问订阅文件", "username", username, "filename", filename, "subscribe_file_id", subscribeFile.ID)
+			writeError(w, http.StatusNotFound, errors.New("not found"))
+			return
 		}
 	}
 
@@ -303,7 +308,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 	resolvedPath := filepath.Join(h.baseDir, cleanedName)
 
-	// 验证解析的路径是否在 baseDir 内以防止路径遍历
+	// Verify resolved path is within baseDir to prevent path traversal
 	absBase, err := filepath.Abs(h.baseDir)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -319,54 +324,95 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// 模板生成优先级:
-	//   - 订阅本身绑了模板 → 用订阅绑定的模板
-	//   - 没绑 + 创建者有套餐 + 套餐配了模板 → 用套餐模板
-	//   - 还没 + 系统配了默认模板 → 用系统默认模板
-	//   - 都没 → 走静态文件路径(原行为)
+	if hasSubscribeFile && subscribeFile.ExpireAt != nil {
+		now := time.Now()
+		if !subscribeFile.ExpireAt.After(now) {
+			logger.Info("[Subscription] 订阅已过期", "filename", filename, "expire_at", subscribeFile.ExpireAt.Format("2006-01-02 15:04:05"))
+			h.serveTokenInvalidResponse(w, r)
+			return
+		}
+	}
+
+	// 非Clash配置：直接输出原始文件内容，跳过所有转换处理
+	if hasSubscribeFile && subscribeFile.RawOutput {
+		rawData, readErr := os.ReadFile(resolvedPath)
+		if readErr != nil {
+			if errors.Is(readErr, os.ErrNotExist) {
+				writeError(w, http.StatusNotFound, readErr)
+			} else {
+				writeError(w, http.StatusInternalServerError, readErr)
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("profile-update-interval", "24")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(rawData)
+
+		logger.Info("📥📥📥 [SUB_FETCH] 用户获取订阅（原始输出）",
+			"user", username, "filename", filename, "bytes", len(rawData),
+			"duration_ms", time.Since(requestStart).Milliseconds(),
+		)
+		clientIP := GetClientIP(r)
+		if silentMgr := GetSilentModeManager(); silentMgr != nil && username != "" {
+			silentMgr.RecordSubscriptionAccessWithIP(username, clientIP)
+		}
+		if bfp := GetBruteForceProtector(); bfp != nil {
+			bfp.RecordSuccess(clientIP)
+		}
+		return
+	}
+
+	// 模板生成逻辑：如果订阅绑定了 V3 模板，使用模板生成配置
 	var data []byte
 	fromTemplate := false
-	fromSurgeTemplate := false // Surge 模板直出:data 已是 Surge 文本,跳过 convertSubscription
-	if hasSubscribeFile {
-		effectiveTemplate := subscribeFile.TemplateFilename
-		if effectiveTemplate == "" && h.repo != nil {
-			creator := strings.TrimSpace(subscribeFile.CreatedBy)
-			if creator != "" {
-				if u, uerr := h.repo.GetUser(r.Context(), creator); uerr == nil && u.PackageID > 0 {
-					if pkg, perr := h.repo.GetPackage(r.Context(), u.PackageID); perr == nil && pkg != nil && strings.TrimSpace(pkg.TemplateFilename) != "" {
-						effectiveTemplate = pkg.TemplateFilename
-						logger.Info("[Subscription] 订阅未绑定模板，使用套餐模板", "template", effectiveTemplate, "package_id", pkg.ID)
-					}
-				}
-			}
-		}
-		// 注意:Clash 系不回退系统默认模板 —— 避免用户精心配的原始 YAML 被"自动套上"覆盖。
-		// 但 Surge 系例外:订阅原始文件是 Clash YAML,Surge 客户端本就要转换,没有"原样保留"诉求;
-		// 且 Surge 策略组/规则必须靠模板生成。故 Surge 请求在订阅/套餐都无模板时回落到系统 Surge 默认模板。
-		if effectiveTemplate == "" && h.repo != nil && isSurgeClientType(r.URL.Query().Get("t")) {
-			if cfg, cerr := h.repo.GetSystemConfig(r.Context()); cerr == nil {
-				if f := strings.TrimSpace(cfg.DefaultSurgeTemplateFilename); f != "" {
-					effectiveTemplate = f
-					logger.Info("[Subscription] Surge 订阅未绑定模板，回落到系统 Surge 默认模板", "template", effectiveTemplate)
-				}
-			}
-		}
-		if effectiveTemplate != "" {
-			stepStart = time.Now()
-			sfForGen := subscribeFile
-			sfForGen.TemplateFilename = effectiveTemplate
-			templateData, genErr := h.generateFromTemplate(r.Context(), sfForGen)
-			if genErr != nil {
-				logger.Info("[Subscription] 模板生成失败，回退到原始文件", "error", genErr, "template", effectiveTemplate)
-			} else {
-				data = templateData
-				fromTemplate = true
-				fromSurgeTemplate = isSurgeTemplateFile(effectiveTemplate)
-				logger.Info("[⏱️ 耗时监测] 模板生成完成", "step", "template_generate", "duration_ms", time.Since(stepStart).Milliseconds(), "bytes", len(data))
+	fromSurgeTemplate := false
+	fromLoonTemplate := false
+	effectiveTemplate := subscribeFile.TemplateFilename
+	if hasSubscribeFile && effectiveTemplate == "" && username != "" {
+		if settings, err := h.repo.GetUserSettings(r.Context(), username); err == nil {
+			// Loon 判断在 Surge 之前(客户端类型独立,这里只是保持与文件判定一致的优先级)。
+			switch ct := resolveClientType(r); {
+			case isLoonTemplateClientType(ct):
+				effectiveTemplate = settings.DefaultLoonTemplateFilename
+			case isSurgeClientType(ct):
+				effectiveTemplate = settings.DefaultSurgeTemplateFilename
+			default:
+				effectiveTemplate = settings.DefaultTemplateFilename
 			}
 		}
 	}
-	_ = fromTemplate
+	if hasSubscribeFile && effectiveTemplate != "" {
+		stepStart = time.Now()
+		fileForTemplate := subscribeFile
+		fileForTemplate.TemplateFilename = effectiveTemplate
+		templateData, err := h.generateFromTemplate(r.Context(), username, fileForTemplate)
+		if err != nil {
+			logger.Info("[Subscription] 模板生成失败，回退到原始文件", "error", err, "template", subscribeFile.TemplateFilename)
+			// 回退到直接读取文件
+		} else {
+			data = templateData
+			fromTemplate = true
+			fromSurgeTemplate = isSurgeTemplateFile(effectiveTemplate)
+			fromLoonTemplate = isLoonTemplateFile(effectiveTemplate)
+			logger.Info("[⏱️ 耗时监测] 模板生成完成", "step", "template_generate", "duration_ms", time.Since(stepStart).Milliseconds(), "bytes", len(data))
+		}
+	}
+
+	// 聚合订阅/标签动态生成：未绑定模板但配置了 selected_tags 时，按标签实时从节点表生成配置
+	// 不使用 selected_node_ids（固定 ID 无法跟踪源订阅节点增删）
+	if len(data) == 0 && hasSubscribeFile && subscribeFile.TemplateFilename == "" &&
+		len(subscribeFile.SelectedTags) > 0 && len(subscribeFile.SelectedNodeIDs) == 0 {
+		stepStart = time.Now()
+		tagData, err := h.generateFromSelectedTags(r.Context(), username, subscribeFile)
+		if err != nil {
+			logger.Info("[Subscription] 按标签动态生成失败，回退到原始文件", "error", err, "tags", subscribeFile.SelectedTags)
+		} else {
+			data = tagData
+			fromTemplate = true // 跳过基于磁盘文件的 MMW 同步，避免覆盖动态内容
+			logger.Info("[Subscription] 按标签动态生成完成", "tags", subscribeFile.SelectedTags, "bytes", len(data), "duration_ms", time.Since(stepStart).Milliseconds())
+		}
+	}
 
 	// 文件读取（如果模板生成失败或未绑定模板）
 	if len(data) == 0 {
@@ -384,29 +430,41 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		logger.Info("[⏱️ 耗时监测] 文件读取完成", "step", "file_read", "duration_ms", time.Since(stepStart).Milliseconds(), "bytes", len(data))
 	}
 
+	// MMW 同步（模板模式下跳过，模板处理已包含代理集合节点）
+	stepStart = time.Now()
+	if h.repo != nil && !fromTemplate {
+		SyncMMWProxyProvidersToFile(h.repo, h.baseDir, cleanedName)
+		// 重新读取更新后的文件
+		updatedData, err := os.ReadFile(resolvedPath)
+		if err == nil {
+			data = updatedData
+		}
+	}
+	logger.Info("[⏱️ 耗时监测] MMW 同步完成", "step", "mmw_sync", "duration_ms", time.Since(stepStart).Milliseconds())
+
 	// 外部订阅同步
 	stepStart = time.Now()
-	// 检查是否启用强制同步外部订阅并仅同步引用的订阅
+	// Check if force sync external subscriptions is enabled and sync only referenced subscriptions
 	if username != "" && h.repo != nil {
 		settings, err := h.repo.GetUserSettings(r.Context(), username)
 		if err == nil && settings.ForceSyncExternal {
 			logger.Info("[Subscription] 用户启用强制同步", "user", username, "cache_expire_minutes", settings.CacheExpireMinutes)
 
-			// 获取当前文件中引用的外部订阅
+			// Get external subscriptions referenced in current file
 			usedExternalSubs, err := GetExternalSubscriptionsFromFile(r.Context(), data, username, h.repo)
 			if err != nil {
 				logger.Info("[Subscription] 获取文件中的外部订阅失败", "error", err)
 			} else if len(usedExternalSubs) > 0 {
 				logger.Info("[Subscription] 找到当前文件引用的外部订阅", "count", len(usedExternalSubs))
 
-				// 获取用户的外部订阅以检查缓存并获取 URL
+				// Get user's external subscriptions to check cache and get URLs
 				allExternalSubs, err := h.repo.ListExternalSubscriptions(r.Context(), username)
 				if err != nil {
 					logger.Info("[Subscription] 获取外部订阅列表失败", "error", err)
 				} else {
-					// 筛选以仅同步当前文件中引用的订阅
+					// Filter to only sync subscriptions that are referenced in the current file
 					var subsToSync []storage.ExternalSubscription
-					subURLMap := make(map[string]string) // URL -> 名称映射
+					subURLMap := make(map[string]string) // URL -> name mapping
 
 					for _, sub := range allExternalSubs {
 						subURLMap[sub.URL] = sub.Name
@@ -417,22 +475,22 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 					logger.Info("[Subscription] 强制同步已启用，将同步引用的外部订阅", "sync_count", len(subsToSync), "total_count", len(allExternalSubs))
 
-					// 检查我们是否需要根据缓存过期进行同步
+					// Check if we need to sync based on cache expiration
 					shouldSync := false
 					if settings.CacheExpireMinutes > 0 {
-						// 仅检查引用订阅的上次同步时间
+						// Check last sync time only for referenced subscriptions
 						for _, sub := range subsToSync {
 							if sub.LastSyncAt == nil {
-								// 以前从未同步过
+								// Never synced before
 								logger.Info("[Subscription] 订阅从未同步过，将进行同步", "name", sub.Name, "url", sub.URL)
 								shouldSync = true
 								break
 							}
 
-							// 计算时间差（以分钟为单位）
+							// Calculate time difference in minutes
 							elapsed := time.Since(*sub.LastSyncAt).Minutes()
 							if elapsed >= float64(settings.CacheExpireMinutes) {
-								// 缓存已过期
+								// Cache expired
 								logger.Info("[Subscription] 订阅缓存已过期，将进行同步", "name", sub.Name, "url", sub.URL, "elapsed_minutes", elapsed, "expire_minutes", settings.CacheExpireMinutes)
 								shouldSync = true
 								break
@@ -442,22 +500,22 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 							logger.Info("[Subscription] All referenced subscriptions are within cache time, skipping sync")
 						}
 					} else {
-						// 缓存过期分钟为0，始终同步
+						// Cache expire minutes is 0, always sync
 						logger.Info("[Subscription] Cache expire minutes is 0, will always sync referenced subscriptions")
 						shouldSync = true
 					}
 
 					if shouldSync {
 						logger.Info("[Subscription] 开始同步用户的外部订阅(仅引用的订阅)", "user", username)
-						// 仅同步引用的外部订阅
+						// Sync only the referenced external subscriptions
 						if err := syncReferencedExternalSubscriptions(r.Context(), h.repo, h.baseDir, username, subsToSync); err != nil {
 							logger.Info("[Subscription] 同步外部订阅失败", "error", err)
-							// 记录错误但不要使请求失败
-							// 同步是尽力而为的
+							// Log error but don't fail the request
+							// The sync is best-effort
 						} else {
 							logger.Info("[Subscription] External subscriptions sync completed successfully")
 
-							// 同步后重新读取订阅文件以获取更新的节点
+							// Re-read the subscription file after sync to get updated nodes
 							updatedData, err := os.ReadFile(resolvedPath)
 							if err != nil {
 								logger.Info("[Subscription] 同步后重新读取订阅文件失败", "error", err)
@@ -477,59 +535,120 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 	// 流量信息收集
 	stepStart = time.Now()
+	// 在转换订阅格式之前，先收集探针服务器和外部订阅流量信息
+	// 这样可以确保无论订阅被转换成什么格式，都能正确收集信息
 	externalTrafficLimit, externalTrafficUsed := int64(0), int64(0)
+	usesProbeNodes := false                  // 是否使用了探针节点
+	probeBindingEnabled := false             // 是否开启了探针服务器绑定
+	var usedProbeServers map[string]struct{} // 订阅文件中使用的探针服务器列表
 
-	if username != "" && h.repo != nil {
+	// 读取系统配置，判断是否启用订阅响应头流量信息
+	enableSubTrafficHeader := true
+	subscriptionOutputFormat := "yaml"
+	if h.repo != nil {
+		if sysConfig, cfgErr := h.repo.GetSystemConfig(r.Context()); cfgErr == nil {
+			enableSubTrafficHeader = sysConfig.EnableSubTrafficHeader
+			subscriptionOutputFormat = sysConfig.SubscriptionOutputFormat
+		}
+	}
+
+	if enableSubTrafficHeader && username != "" && h.repo != nil {
 		settings, err := h.repo.GetUserSettings(r.Context(), username)
-		if err == nil && settings.SyncTraffic {
-			// 解析 YAML 文件，获取其中使用的节点名称
-			var yamlConfig map[string]any
-			if err := yaml.Unmarshal(data, &yamlConfig); err == nil {
-				if proxies, ok := yamlConfig["proxies"].([]any); ok {
-					logger.Info("[Subscription] 找到订阅YAML中的代理节点", "count", len(proxies))
-					usedNodeNames := make(map[string]bool)
-					for _, proxy := range proxies {
-						if proxyMap, ok := proxy.(map[string]any); ok {
-							if name, ok := proxyMap["name"].(string); ok && name != "" {
-								usedNodeNames[name] = true
-							}
-						}
-					}
+		if err == nil {
+			probeBindingEnabled = settings.EnableProbeBinding
 
-					if len(usedNodeNames) > 0 {
-						nodes, err := h.repo.ListNodes(r.Context(), username)
-						if err == nil {
-							usedExternalSubs := make(map[string]bool)
-							for _, node := range nodes {
-								if usedNodeNames[node.NodeName] {
-									if node.Tag != "" && node.Tag != "手动输入" {
-										usedExternalSubs[node.Tag] = true
-									}
+			// 如果开启了探针绑定或流量同步，需要解析 YAML 获取节点信息
+			if probeBindingEnabled || settings.SyncTraffic {
+				// 解析 YAML 文件，获取其中使用的节点名称
+				var yamlConfig map[string]any
+				if err := yaml.Unmarshal(data, &yamlConfig); err == nil {
+					if proxies, ok := yamlConfig["proxies"].([]any); ok {
+						logger.Info("[Subscription] 找到订阅YAML中的代理节点", "count", len(proxies))
+						// 收集所有节点名称
+						usedNodeNames := make(map[string]bool)
+						for _, proxy := range proxies {
+							if proxyMap, ok := proxy.(map[string]any); ok {
+								if name, ok := proxyMap["name"].(string); ok && name != "" {
+									usedNodeNames[name] = true
 								}
 							}
+						}
 
-							if len(usedExternalSubs) > 0 {
-								logger.Info("[Subscription] 找到使用中的外部订阅", "user", username, "count", len(usedExternalSubs))
-								externalSubs, err := h.repo.ListExternalSubscriptions(r.Context(), username)
-								if err == nil {
-									now := time.Now()
-									for _, sub := range externalSubs {
-										if usedExternalSubs[sub.Name] {
-											if sub.Expire != nil && sub.Expire.Before(now) {
-												continue
+						// 如果有节点名称，从数据库查询这些节点
+						if len(usedNodeNames) > 0 {
+							logger.Info("[Subscription] 查询数据库中的节点", "count", len(usedNodeNames))
+							nodes, err := h.repo.ListNodes(r.Context(), username)
+							if err == nil {
+								// 收集使用到的外部订阅URL（通过 RawURL 识别）
+								usedExternalSubURLs := make(map[string]bool)
+
+								for _, node := range nodes {
+									// 检查节点是否在订阅文件中
+									if usedNodeNames[node.NodeName] {
+										// 检测是否为探针节点（有绑定探针服务器）
+										if probeBindingEnabled && node.ProbeServer != "" {
+											usesProbeNodes = true
+											// 收集订阅文件中使用的探针服务器
+											if usedProbeServers == nil {
+												usedProbeServers = make(map[string]struct{})
 											}
-											externalTrafficLimit += sub.Total
-											switch sub.TrafficMode {
-											case "download":
-												externalTrafficUsed += sub.Download
-											case "upload":
-												externalTrafficUsed += sub.Upload
-											default:
-												externalTrafficUsed += sub.Upload + sub.Download
-											}
+											usedProbeServers[node.ProbeServer] = struct{}{}
+											logger.Info("[Subscription] 检测到探针节点绑定服务器", "node_name", node.NodeName, "probe_server", node.ProbeServer)
+										}
+
+										// 如果开启了流量同步，通过 RawURL 收集外部订阅节点
+										if settings.SyncTraffic && node.RawURL != "" {
+											usedExternalSubURLs[node.RawURL] = true
 										}
 									}
 								}
+
+								// 如果开启了流量同步且有使用到外部订阅的节点，汇总这些订阅的流量
+								if settings.SyncTraffic && len(usedExternalSubURLs) > 0 {
+									logger.Info("[Subscription] 用户启用流量同步，找到使用中的外部订阅", "user", username, "count", len(usedExternalSubURLs))
+									externalSubs, err := h.repo.ListExternalSubscriptions(r.Context(), username)
+									if err == nil {
+										now := time.Now()
+										for _, sub := range externalSubs {
+											// 只汇总使用到的外部订阅（通过URL匹配）
+											if usedExternalSubURLs[sub.URL] {
+												// 如果有过期时间且已过期，则跳过
+												// 如果过期时间为空，表示长期订阅，不跳过
+												if sub.Expire != nil && sub.Expire.Before(now) {
+													logger.Info("[Subscription] 跳过已过期的外部订阅", "name", sub.Name, "expire", sub.Expire.Format("2006-01-02 15:04:05"))
+													continue
+												}
+												// 如果流量模式为 "none"，跳过此订阅
+												if sub.TrafficMode == "none" {
+													logger.Info("[Subscription] 跳过不统计外部订阅", "name", sub.Name)
+													continue
+												}
+												if sub.Expire == nil {
+													logger.Info("[Subscription] 添加长期外部订阅流量", "name", sub.Name, "upload", sub.Upload, "download", sub.Download, "total", sub.Total, "mode", sub.TrafficMode)
+												} else {
+													logger.Info("[Subscription] 添加外部订阅流量", "name", sub.Name, "upload", sub.Upload, "download", sub.Download, "total", sub.Total, "mode", sub.TrafficMode, "expire", sub.Expire.Format("2006-01-02 15:04:05"))
+												}
+												externalTrafficLimit += sub.Total
+												// 根据 TrafficMode 计算已用流量
+												switch sub.TrafficMode {
+												case "download":
+													externalTrafficUsed += sub.Download
+												case "upload":
+													externalTrafficUsed += sub.Upload
+												default: // "both" 或空
+													externalTrafficUsed += sub.Upload + sub.Download
+												}
+											}
+										}
+										logger.Info("[Subscription] 外部订阅流量汇总", "limit_bytes", externalTrafficLimit, "limit_gb", float64(externalTrafficLimit)/(1024*1024*1024), "used_bytes", externalTrafficUsed, "used_gb", float64(externalTrafficUsed)/(1024*1024*1024))
+									} else {
+										logger.Info("[Subscription] 获取外部订阅列表失败", "error", err)
+									}
+								} else if settings.SyncTraffic {
+									logger.Info("[Subscription] 用户启用流量同步但未找到使用中的外部订阅节点", "user", username)
+								}
+							} else {
+								logger.Info("[Subscription] 获取节点列表失败", "error", err)
 							}
 						}
 					}
@@ -587,56 +706,103 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	logger.Info("[⏱️ 耗时监测] 节点排序完成", "step", "node_order", "duration_ms", time.Since(stepStart).Milliseconds())
 
-	// 链式代理注入：根据 chain_proxy_node_id 注入 dialer-proxy
+	// 执行覆写脚本（post_fetch 钩子），转换为客户端配置前执行，对所有客户端类型生效
 	stepStart = time.Now()
-	if username != "" && h.repo != nil {
-		data = injectChainProxy(r.Context(), h.repo, username, data)
-	}
-	logger.Info("[⏱️ 耗时监测] 链式代理注入完成", "step", "chain_proxy", "duration_ms", time.Since(stepStart).Milliseconds())
-
-	// 执行覆写脚本（post_fetch 钩子）
-	stepStart = time.Now()
-	if username != "" && h.repo != nil {
-		if sysCfg, err := h.repo.GetSystemConfig(r.Context()); err == nil && sysCfg.EnableOverrideScripts {
-			// 该订阅选中的覆写脚本(空=全部启用的生效)。脚本本就按 username 隔离,不会混入管理员的。
-			selectedScriptIDs := makeIDSet(subscribeFile.SelectedOverrideScriptIDs)
-			scripts, _ := h.repo.ListOverrideScripts(r.Context(), username, "post_fetch")
-			for _, s := range scripts {
-				if !s.Enabled {
-					continue
+	if hasSubscribeFile && subscribeFile.AutoSyncCustomRules {
+		if username := auth.UsernameFromContext(r.Context()); username != "" {
+			if sysCfg, err := h.repo.GetSystemConfig(r.Context()); err == nil && sysCfg.EnableOverrideScripts {
+				selectedScriptIDs := makeIDSet(subscribeFile.SelectedOverrideScriptIDs)
+				scripts, _ := h.repo.ListOverrideScripts(r.Context(), username, "post_fetch")
+				logger.Info("[OverrideScript] 开始执行覆写脚本", "total_scripts", len(scripts), "selected_ids", subscribeFile.SelectedOverrideScriptIDs)
+				for _, s := range scripts {
+					if !s.Enabled {
+						logger.Info("[OverrideScript] 跳过未启用的脚本", "script", s.Name, "id", s.ID)
+						continue
+					}
+					if len(selectedScriptIDs) > 0 && !selectedScriptIDs[s.ID] {
+						logger.Info("[OverrideScript] 跳过未选中的脚本", "script", s.Name, "id", s.ID)
+						continue
+					}
+					modified, err := h.runPostFetchScript(r.Context(), s.Content, data)
+					if err != nil {
+						logger.Info("[OverrideScript] post_fetch 脚本执行失败", "script", s.Name, "error", err)
+						continue
+					}
+					logger.Info("[OverrideScript] post_fetch 脚本执行成功", "script", s.Name, "id", s.ID, "input_bytes", len(data), "output_bytes", len(modified))
+					data = modified
 				}
-				if len(selectedScriptIDs) > 0 && !selectedScriptIDs[s.ID] {
-					continue
-				}
-				modified, err := h.runPostFetchScript(r.Context(), s.Content, data)
-				if err != nil {
-					logger.Info("[OverrideScript] post_fetch 脚本执行失败", "script", s.Name, "error", err)
-					continue
-				}
-				data = modified
+			} else {
+				logger.Info("[OverrideScript] 覆写脚本功能未启用", "enable_override_scripts", sysCfg.EnableOverrideScripts, "err", err)
 			}
 		}
+	} else if hasSubscribeFile {
+		logger.Info("[OverrideScript] 订阅文件未开启自动应用", "auto_sync_custom_rules", subscribeFile.AutoSyncCustomRules)
 	}
 	logger.Info("[⏱️ 耗时监测] 覆写脚本执行完成", "step", "override_script", "duration_ms", time.Since(stepStart).Milliseconds())
+
+	// 动态应用自定义规则
+	stepStart = time.Now()
+	if hasSubscribeFile && subscribeFile.AutoSyncCustomRules {
+		selectedRuleIDs := makeIDSet(subscribeFile.SelectedCustomRuleIDs)
+		if modified, _, applyErr := applyCustomRulesToYamlFiltered(r.Context(), h.repo, data, selectedRuleIDs); applyErr != nil {
+			logger.Info("[Subscription] 应用自定义规则失败", "error", applyErr)
+		} else {
+			data = modified
+		}
+	}
+	logger.Info("[⏱️ 耗时监测] 自定义规则应用完成", "step", "apply_custom_rules", "duration_ms", time.Since(stepStart).Milliseconds())
 
 	// 格式转换
 	stepStart = time.Now()
 	// 根据参数t的类型调用substore的转换代码
-	clientType := strings.TrimSpace(r.URL.Query().Get("t"))
-	// 默认浏览器打开时直接输入文本, 不再下载问卷
+	clientType := resolveClientType(r)
+	// 默认浏览器打开时直接输出文本, 不再下载文件
 	contentType := "text/yaml; charset=utf-8; charset=UTF-8"
 	ext := filepath.Ext(filename)
 	if ext == "" {
 		ext = ".yaml"
 	}
 
-	// Surge 模板直出:data 已是完整 Surge 配置,不能再当 YAML 转换,直接文本输出。
+	data = deduplicateProxies(data, username)
+
+	// v2ray 订阅信息节点(SubInfoV2RayOnly):v2ray/base64 输出没有 proxies 结构可供事后注入,
+	// 得在转换成 base64 之前就把信息节点塞进 clash proxies,让 v2ray producer 当普通节点吐出来。
+	if h.repo != nil && isV2RayClientType(clientType) {
+		if sysConfig, cfgErr := h.repo.GetSystemConfig(r.Context()); cfgErr == nil &&
+			sysConfig.EnableSubInfoNodes && sysConfig.SubInfoV2RayOnly {
+			var remainingTraffic int64
+			if enableSubTrafficHeader {
+				if tl, _, tu, terr := h.summary.fetchTotals(r.Context(), username, usedProbeServers); terr == nil {
+					if !probeBindingEnabled || usesProbeNodes {
+						remainingTraffic = (tl + externalTrafficLimit) - (tu + externalTrafficUsed)
+					} else {
+						remainingTraffic = externalTrafficLimit - externalTrafficUsed
+					}
+				}
+			} else {
+				remainingTraffic = externalTrafficLimit - externalTrafficUsed
+			}
+			var expireAt *time.Time
+			if hasSubscribeFile {
+				expireAt = subscribeFile.ExpireAt
+			}
+			if modified, perr := prependSubInfoNodesToClash(data, sysConfig, expireAt, remainingTraffic); perr == nil {
+				data = modified
+			}
+		}
+	}
+
+	// clash/classmeta/clash-to-shadowrocket 直接输出 Clash YAML, 不需要转换
 	if fromSurgeTemplate {
 		contentType = "text/plain; charset=utf-8"
 		ext = ".conf"
-	} else if clientType != "" && clientType != "clash" && clientType != "clashmeta" {
-		// clash 和 clashmeta 类型直接输出源文件, 不需要转换
-		// 使用子商店生产者转换订阅
+	} else if fromLoonTemplate {
+		// Loon 模板已是成品纯文本(段落式配置),直接下发,不进任何转换分支。
+		contentType = "text/plain; charset=utf-8"
+		ext = ".lcf"
+	} else if clientType == "" || clientType == "clash" || clientType == "clashmeta" {
+		data = filterSnellV6FromClashYAML(data)
+	} else if clientType != "clash-to-shadowrocket" {
 		convertedData, err := h.convertSubscription(r.Context(), data, clientType)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("failed to convert subscription for client %s: %w", clientType, err))
@@ -644,31 +810,38 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		}
 		data = convertedData
 
-		// 根据客户端类型设置内容类型和扩展名
+		// Set content type and extension based on client type
 		switch clientType {
-		case "surge", "surgemac", "loon", "qx", "surfboard", "shadowrocket", "clash-to-shadowrocket", "clash-to-surge", "clash-to-loon", "clash-to-loon-kelee":
-			// 基于文本的格式
+		case "surge", "surgemac", "loon", "qx", "surfboard", "shadowrocket", "clash-to-surge", "clash-to-loon", "clash-to-loon-kelee":
 			contentType = "text/plain; charset=utf-8"
 			ext = ".txt"
 		case "sing-box":
-			// JSON格式
 			contentType = "application/json; charset=utf-8"
 			ext = ".json"
 		case "v2ray":
-			// Base64 格式
 			contentType = "text/plain; charset=utf-8"
 			ext = ".txt"
 		case "uri":
-			// 统一资源定位符格式
 			contentType = "text/plain; charset=utf-8"
 			ext = ".txt"
 		default:
-			// 基于 YAML 的格式（clash、clashmeta、stash、shadowrocket、egern）
 			contentType = "text/yaml; charset=utf-8"
 			ext = ".yaml"
 		}
 	}
 	logger.Info("[⏱️ 耗时监测] 格式转换完成", "step", "format_convert", "duration_ms", time.Since(stepStart).Milliseconds(), "client_type", clientType)
+
+	// 流量统计获取
+	stepStart = time.Now()
+	var totalLimit, totalUsed int64
+	hasTrafficInfo := false
+	if enableSubTrafficHeader {
+		// 尝试获取流量信息，如果探针报错则跳过流量统计，不影响订阅输出
+		// 如果开启了探针绑定，只统计订阅文件中使用的节点绑定的探针服务器流量
+		totalLimit, _, totalUsed, err = h.summary.fetchTotals(r.Context(), username, usedProbeServers)
+		hasTrafficInfo = err == nil
+	}
+	logger.Info("[⏱️ 耗时监测] 流量统计获取完成", "step", "traffic_fetch", "duration_ms", time.Since(stepStart).Milliseconds())
 
 	// 使用订阅名称
 	attachmentName := url.PathEscape(displayName)
@@ -697,24 +870,58 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 							// 先修复 WireGuard 节点的 allowed-ips 字段
 							fixWireGuardAllowedIPs(proxiesNode)
 							reorderProxies(proxiesNode)
+
+							// 注入订阅信息节点（过期时间和剩余流量）
+							if h.repo != nil {
+								sysConfig, cfgErr := h.repo.GetSystemConfig(r.Context())
+								// SubInfoV2RayOnly 开启时,clash 客户端不再注入(信息节点只走上面的 v2ray 分支)。
+								if cfgErr == nil && sysConfig.EnableSubInfoNodes && !sysConfig.SubInfoV2RayOnly {
+									// 计算剩余流量
+									var remainingTraffic int64
+									if hasTrafficInfo || externalTrafficLimit > 0 {
+										includeProbeTraffic := !probeBindingEnabled || usesProbeNodes
+										if includeProbeTraffic && hasTrafficInfo {
+											remainingTraffic = (totalLimit + externalTrafficLimit) - (totalUsed + externalTrafficUsed)
+										} else {
+											remainingTraffic = externalTrafficLimit - externalTrafficUsed
+										}
+									}
+									// 获取过期时间
+									var expireAt *time.Time
+									if hasSubscribeFile {
+										expireAt = subscribeFile.ExpireAt
+									}
+									// 在 proxies 数组开头插入信息节点
+									infoNodes := createSubInfoNodes(sysConfig, expireAt, remainingTraffic)
+									proxiesNode.Content = append(infoNodes, proxiesNode.Content...)
+								}
+							}
 						}
 						break
 					}
 				}
 
-				// 重新排序 proxy-groups 中每个代理组的字段
+				// 重新排序 proxy-groups 中每个代理组的字段，并剥离 dialer-proxy-group（MMW 自定义字段，不输出到订阅响应）
 				for i := 0; i < len(rootMap.Content); i += 2 {
 					if rootMap.Content[i].Value == "proxy-groups" {
 						proxyGroupsNode := rootMap.Content[i+1]
 						if proxyGroupsNode.Kind == yaml.SequenceNode {
 							reorderProxyGroups(proxyGroupsNode)
-							// 读 dialer-proxy-group 字段 → 给顶层 proxies 注入 dialer-proxy
-							// (顺序:先 inject 读字段,再 strip 删字段;链式代理已注入的 dialer-proxy 不覆盖)
-							injectDialerProxyFromGroups(rootMap)
 							stripDialerProxyGroup(proxyGroupsNode)
 						}
 						break
 					}
+				}
+
+				// 兼容旧链式代理配置：如果存在 "🌄 落地节点" 和 "🌠 中转节点" 代理组，
+				// 给落地节点组内的节点自动添加 dialer-proxy: 🌠 中转节点
+				injectLegacyDialerProxy(rootMap)
+
+				// 中转组：从数据库获取节点的中转组配置，注入 dialer-proxy 和代理组
+				// 模板路径(fromTemplate)已在 generateFromTemplate 内注入过中转组，
+				// 此处再注入会导致重复，故仅在非模板路径执行。
+				if username != "" && h.repo != nil && !fromTemplate {
+					injectRelayGroups(r.Context(), h.repo, username, rootMap)
 				}
 
 				// 查找 rule-providers 的位置
@@ -723,6 +930,29 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 					if rootMap.Content[i].Value == "rule-providers" {
 						ruleProvidersIdx = i
 						break
+					}
+				}
+
+				// clash-to-shadowrocket: 将 rule-providers 中 format: mrs 改为 yaml，url .mrs 改为 .yaml
+				if clientType == "clash-to-shadowrocket" && ruleProvidersIdx >= 0 {
+					providersNode := rootMap.Content[ruleProvidersIdx+1]
+					if providersNode.Kind == yaml.MappingNode {
+						for j := 1; j < len(providersNode.Content); j += 2 {
+							providerValue := providersNode.Content[j]
+							if providerValue.Kind != yaml.MappingNode {
+								continue
+							}
+							for k := 0; k < len(providerValue.Content); k += 2 {
+								key := providerValue.Content[k].Value
+								val := providerValue.Content[k+1]
+								if key == "format" && val.Value == "mrs" {
+									val.Value = "yaml"
+								}
+								if key == "url" && strings.HasSuffix(val.Value, ".mrs") {
+									val.Value = strings.TrimSuffix(val.Value, ".mrs") + ".yaml"
+								}
+							}
+						}
 					}
 				}
 
@@ -742,7 +972,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 			// 重新序列化为 YAML (使用2空格缩进)
 			if reorderedData, err := MarshalYAMLWithIndent(&yamlNode); err == nil {
-				// 修复表情符号转义和引用的数字
+				// Fix emoji escapes and quoted numbers
 				fixed := RemoveUnicodeEscapeQuotes(string(reorderedData))
 				data = []byte(fixed)
 			}
@@ -750,76 +980,67 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 	logger.Info("[⏱️ 耗时监测] YAML 重排序完成", "step", "yaml_reorder", "duration_ms", time.Since(stepStart).Milliseconds())
 
-	// 系统配置 subscription_output_format == "json" 且当前是 YAML content-type → 转 JSON 输出。
-	// 仅影响 Clash 订阅(其它客户端格式如 Surge/Sing-Box 在前面 convertSubscription 那段已切了 content-type,
-	// 不会命中这里的 text/yaml 判断)。
-	if h.repo != nil {
-		if sysCfg, err := h.repo.GetSystemConfig(r.Context()); err == nil && sysCfg.SubscriptionOutputFormat == "json" &&
-			(contentType == "text/yaml; charset=utf-8" || contentType == "text/yaml; charset=utf-8; charset=UTF-8") {
-			if jsonBytes, jsonErr := marshalSubscriptionJSON(data); jsonErr == nil {
-				data = jsonBytes
-				contentType = "application/json; charset=utf-8"
-				ext = ".json"
-			} else {
-				logger.Warn("[Subscription] YAML → JSON 转换失败,回落 YAML 输出", "error", jsonErr)
-			}
+	// 当系统配置为 JSON 输出且当前仍为 YAML 格式时，转换为 JSON
+	if subscriptionOutputFormat == "json" &&
+		(contentType == "text/yaml; charset=utf-8" || contentType == "text/yaml; charset=utf-8; charset=UTF-8") {
+		if jsonBytes, jsonErr := marshalSubscriptionJSON(data); jsonErr == nil {
+			data = jsonBytes
+			contentType = "application/json; charset=utf-8"
+			ext = ".json"
 		}
 	}
 
 	w.Header().Set("Content-Type", contentType)
+	// 只有在启用了订阅流量响应头且有流量信息时才添加 subscription-userinfo 头
+	if enableSubTrafficHeader && (hasTrafficInfo || externalTrafficLimit > 0) {
+		var finalLimit, finalUsed int64
 
-	// 远程服务器流量统计:
-	//   - 订阅创建者是普通用户且绑了套餐 → 用套餐口径(pkg.TrafficLimitBytes + 用户已用 × multiplier),
-	//     跟"流量信息"页一致,避免把全平台所有服务器流量塞进 subscription-userinfo。
-	//   - admin / 无套餐 / 找不到用户 → 沿用 stats_server_ids 那套老逻辑。
-	remoteTrafficLimit, remoteTrafficUsed := int64(0), int64(0)
-	if hasSubscribeFile && h.repo != nil {
-		creator := strings.TrimSpace(subscribeFile.CreatedBy)
-		usedPackageScope := false
-		if creator != "" {
-			if user, uerr := h.repo.GetUser(r.Context(), creator); uerr == nil && user.Role != storage.RoleAdmin && user.PackageID > 0 {
-				if pkg, perr := h.repo.GetPackage(r.Context(), user.PackageID); perr == nil && pkg != nil {
-					// 有效上限 = 用户级覆写 ?? 套餐流量,与 enforcer 断流口径一致。
-					remoteTrafficLimit = resolveTrafficLimitBytes(&user, pkg)
-					// 计费流量:倍率已在采集时折算,拿到即最终值。
-					if billable, terr := h.repo.GetUserBillableTraffic(r.Context(), creator); terr == nil {
-						remoteTrafficUsed = billable
-					}
-					usedPackageScope = true
+		if hasSubscribeFile && subscribeFile.StatsServerIDs != "" {
+			// 订阅文件配置了统计服务器，按 server_id 过滤探针流量（优先级最高）
+			idList := strings.Split(subscribeFile.StatsServerIDs, ",")
+			statsLimit, _, statsUsed, statsErr := h.summary.fetchTotalsByServerIDs(r.Context(), idList)
+			if statsErr == nil {
+				if subscribeFile.TrafficLimit != nil {
+					finalLimit = int64(*subscribeFile.TrafficLimit*1024*1024*1024) + externalTrafficLimit
+				} else {
+					finalLimit = statsLimit + externalTrafficLimit
 				}
-			}
-		}
-		if !usedPackageScope {
-			var serverIDs []int64
-			if subscribeFile.StatsServerIDs != "" {
-				for _, idStr := range strings.Split(subscribeFile.StatsServerIDs, ",") {
-					idStr = strings.TrimSpace(idStr)
-					if id, err := strconv.ParseInt(idStr, 10, 64); err == nil && id > 0 {
-						serverIDs = append(serverIDs, id)
-					}
-				}
-			}
-			if len(serverIDs) > 0 {
-				remoteTrafficLimit, remoteTrafficUsed, _ = h.repo.GetRemoteServerTrafficTotals(r.Context(), serverIDs)
+				finalUsed = statsUsed + externalTrafficUsed
 			} else {
-				remoteTrafficLimit, remoteTrafficUsed, _ = h.repo.GetAllRemoteServersTrafficTotals(r.Context())
+				finalLimit = externalTrafficLimit
+				finalUsed = externalTrafficUsed
 			}
-			// 同流量列表口径:仅当订阅自带 traffic_limit > 0 才作"显式覆盖",
-			// nil / 0 都视作"跟随服务器"。
-			if subscribeFile.TrafficLimit != nil && *subscribeFile.TrafficLimit > 0 {
-				remoteTrafficLimit = int64(*subscribeFile.TrafficLimit * 1024 * 1024 * 1024)
+		} else if hasSubscribeFile && subscribeFile.TrafficLimit != nil {
+			// 仅配置了总流量上限，已用流量走原有逻辑
+			includeProbeTraffic := !probeBindingEnabled || usesProbeNodes
+			finalLimit = int64(*subscribeFile.TrafficLimit*1024*1024*1024) + externalTrafficLimit
+			if includeProbeTraffic && hasTrafficInfo {
+				finalUsed = totalUsed + externalTrafficUsed
+			} else {
+				finalUsed = externalTrafficUsed
 			}
-		} else if subscribeFile.TrafficLimit != nil && *subscribeFile.TrafficLimit > 0 {
-			// 套餐口径下,如果订阅自带 traffic_limit 覆盖,以覆盖为准
-			remoteTrafficLimit = int64(*subscribeFile.TrafficLimit * 1024 * 1024 * 1024)
+		} else {
+			// 原有逻辑
+			includeProbeTraffic := !probeBindingEnabled || usesProbeNodes
+			if includeProbeTraffic && hasTrafficInfo {
+				finalLimit = totalLimit + externalTrafficLimit
+				finalUsed = totalUsed + externalTrafficUsed
+			} else {
+				finalLimit = externalTrafficLimit
+				finalUsed = externalTrafficUsed
+			}
 		}
-	}
 
-	totalTrafficLimit := externalTrafficLimit + remoteTrafficLimit
-	totalTrafficUsed := externalTrafficUsed + remoteTrafficUsed
-	if totalTrafficLimit > 0 {
-		headerValue := buildSubscriptionHeader(totalTrafficLimit, totalTrafficUsed)
+		logger.Info("[Subscription] 外部订阅流量", "limit_bytes", externalTrafficLimit, "limit_gb", float64(externalTrafficLimit)/(1024*1024*1024), "used_bytes", externalTrafficUsed, "used_gb", float64(externalTrafficUsed)/(1024*1024*1024))
+		logger.Info("[Subscription] 总流量", "limit_bytes", finalLimit, "limit_gb", float64(finalLimit)/(1024*1024*1024), "used_bytes", finalUsed, "used_gb", float64(finalUsed)/(1024*1024*1024))
+
+		var expireAt *time.Time
+		if hasSubscribeFile {
+			expireAt = subscribeFile.ExpireAt
+		}
+		headerValue := buildSubscriptionHeader(finalLimit, finalUsed, expireAt)
 		w.Header().Set("subscription-userinfo", headerValue)
+		logger.Info("[Subscription] 设置订阅用户信息头", "header", headerValue)
 	}
 	w.Header().Set("profile-update-interval", "24")
 	// 只有非浏览器访问时才添加 content-disposition 头（避免浏览器直接下载）
@@ -827,11 +1048,37 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	isBrowser := strings.Contains(userAgent, "Mozilla") || strings.Contains(userAgent, "Chrome") || strings.Contains(userAgent, "Safari") || strings.Contains(userAgent, "Edge")
 	if !isBrowser {
 		w.Header().Set("content-disposition", "attachment;filename*=UTF-8''"+attachmentName)
-		// profile-title:Surge/Loon/QX 优先认此头显示订阅名(否则回退 URL 短码显示成数字)。
-		w.Header().Set("profile-title", "base64:"+base64.StdEncoding.EncodeToString([]byte(displayName)))
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
+
+	// 📥 订阅获取日志 - 方便管理员搜索和追踪
+	logger.Info("📥📥📥 [SUB_FETCH] 用户获取订阅",
+		"user", username,
+		"subscription", displayName,
+		"filename", filename,
+		"client_type", clientType,
+		"bytes", len(data),
+		"duration_ms", time.Since(requestStart).Milliseconds(),
+	)
+
+	if n := GetNotifier(); n != nil {
+		go n.Send(context.Background(), notify.Event{
+			Type:    notify.EventSubscribeFetch,
+			Title:   "订阅获取",
+			Message: fmt.Sprintf("用户 `%s` 获取了订阅 `%s`\n客户端: %s", username, displayName, clientType),
+		})
+	}
+
+	// 更新静默模式活跃时间
+	clientIP := GetClientIP(r)
+	if silentMgr := GetSilentModeManager(); silentMgr != nil && username != "" {
+		silentMgr.RecordSubscriptionAccessWithIP(username, clientIP)
+	}
+	if bfp := GetBruteForceProtector(); bfp != nil {
+		bfp.RecordSuccess(clientIP)
+	}
+
 	logger.Info("[⏱️ 耗时监测] 请求处理完成", "total_duration_ms", time.Since(requestStart).Milliseconds(), "username", username, "filename", filename)
 }
 
@@ -862,179 +1109,17 @@ func (h *SubscriptionHandler) resolveSubscription(ctx context.Context, name stri
 	return h.repo.GetFirstSubscriptionLink(ctx)
 }
 
-// generateFromTemplate 基于绑定的 V3 模板生成订阅配置
-// 代理节点来源：所有远程服务器的节点（ListAllNodes），按 SelectedTags 过滤
-// makeIDSet 把 ID 切片转成集合;空切片返回 nil(调用方据此判断"不过滤=全部生效")。
-func makeIDSet(ids []int64) map[int64]bool {
-	if len(ids) == 0 {
-		return nil
-	}
-	m := make(map[int64]bool, len(ids))
-	for _, id := range ids {
-		m[id] = true
-	}
-	return m
-}
-
-func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscribeFile storage.SubscribeFile) ([]byte, error) {
-	if subscribeFile.TemplateFilename == "" {
-		return nil, errors.New("订阅未绑定模板")
-	}
-
-	templatePath := filepath.Join("rule_templates", subscribeFile.TemplateFilename)
-	templateContent, err := os.ReadFile(templatePath)
-	if err != nil {
-		return nil, fmt.Errorf("读取模板文件失败: %w", err)
-	}
-
-	// 节点池选择:
-	//   - 订阅创建者是普通用户且绑了套餐 → 仅套餐内的节点(避免普通用户订阅里出现他没买的节点)
-	//   - 订阅创建者是管理员 / 普通用户没套餐 / 没找到用户 → 沿用旧行为(所有节点)
-	// 这跟 routes/nodes.index.tsx 普通用户的"自己导入 + 套餐"视图一致,符合用户预期。
-	var nodes []storage.Node
-	creator := strings.TrimSpace(subscribeFile.CreatedBy)
-	restrictToPackage := false
-	if creator != "" {
-		if user, uerr := h.repo.GetUser(ctx, creator); uerr == nil && user.Role != storage.RoleAdmin && user.PackageID > 0 {
-			if pkg, perr := h.repo.GetPackage(ctx, user.PackageID); perr == nil && pkg != nil {
-				restrictToPackage = true
-				nodes = make([]storage.Node, 0, len(pkg.Nodes))
-				for _, nid := range pkg.Nodes {
-					if pn, nerr := h.repo.GetNodeByID(ctx, nid); nerr == nil {
-						nodes = append(nodes, pn)
-					}
-				}
-			}
-		}
-	}
-	if !restrictToPackage {
-		allNodes, lerr := h.repo.ListAllNodes(ctx)
-		if lerr != nil {
-			return nil, fmt.Errorf("获取节点列表失败: %w", lerr)
-		}
-		nodes = allNodes
-	}
-
-	// 按订阅创建者的 nodeOrder 重排 nodes — 影响 __PROXY_NODES__ 占位符展开顺序、
-	// 也直接决定订阅顶层 proxies 数组顺序。
-	// 之前漏掉了这一步,模板订阅生成后节点按 created_at(ListAllNodes 默认 DESC)
-	// 或 pkg.Nodes 数组顺序,跟用户在节点管理里拖好的顺序对不上。
-	if creator != "" {
-		nodes = orderNodesByUserOrder(ctx, h.repo, creator, nodes)
-	}
-
-	// 优先按节点 ID 过滤(新模式);为空回退按标签过滤(legacy 兼容)
-	selectedNodeIDsMap := make(map[int64]bool, len(subscribeFile.SelectedNodeIDs))
-	for _, id := range subscribeFile.SelectedNodeIDs {
-		selectedNodeIDsMap[id] = true
-	}
-	hasNodeFilter := len(selectedNodeIDsMap) > 0
-
-	selectedTagsMap := make(map[string]bool)
-	for _, tag := range subscribeFile.SelectedTags {
-		selectedTagsMap[tag] = true
-	}
-	hasTagFilter := !hasNodeFilter && len(selectedTagsMap) > 0
-
-	nodeIDToName := make(map[int64]string, len(nodes))
-	for _, node := range nodes {
-		nodeIDToName[node.ID] = node.NodeName
-	}
-
-	// 凭据替换基础设施 — 普通用户只能拿到自己的 uuid/password/auth,不能下发 admin 凭据。
-	//   - 普通节点:applyUserCredentials 按协议主键覆写
-	//   - routed 节点:buildRoutedProxyForUser 用 user_subaccounts 重建 proxy
-	// admin 创建的订阅不走这条路径(用 admin 自己的凭据正常)。
-	var credMap map[credKey]string
-	if creator != "" && restrictToPackage {
-		credMap = buildUserCredMapForCreator(ctx, h.repo, creator)
-	}
-
-	var proxies []map[string]any
-	for _, node := range nodes {
-		if !node.Enabled {
-			continue
-		}
-		if hasNodeFilter && !selectedNodeIDsMap[node.ID] {
-			continue
-		}
-		if hasTagFilter && !node.HasAnyTag(selectedTagsMap) {
-			continue
-		}
-		var proxyConfig map[string]any
-		if restrictToPackage && node.NodeType == "routed" {
-			// routed:必须有 active 子账号才能给该用户;没的话整个节点过滤掉,
-			// 否则会泄露 admin 在父节点的 uuid。
-			built, ok := buildRoutedProxyForUser(ctx, h.repo, node, creator)
-			if !ok {
-				continue
-			}
-			proxyConfig = built
-		} else {
-			if node.ClashConfig == "" {
-				continue
-			}
-			if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
-				continue
-			}
-			if credMap != nil {
-				applyUserCredentials(proxyConfig, node, credMap)
-			}
-		}
-		proxyConfig["name"] = node.NodeName
-		if node.ChainProxyNodeID != nil {
-			if targetName, ok := nodeIDToName[*node.ChainProxyNodeID]; ok {
-				proxyConfig["dialer-proxy"] = targetName
-			}
-		}
-		proxies = append(proxies, proxyConfig)
-	}
-	logger.Info("[模板生成] 节点筛选完成", "total", len(nodes), "filtered", len(proxies), "node_filter", hasNodeFilter, "tag_filter", hasTagFilter, "restricted_to_package", restrictToPackage)
-
-	if len(proxies) == 0 {
-		return nil, errors.New("无可用节点")
-	}
-
-	// Surge 模板(.conf):不走 Clash/YAML 处理器,直接把节点注入 [Proxy] 段后原样输出。
-	// 地区分组靠模板里的 policy-regex-filter + include-all-proxies=1 从注入的节点中筛选。
-	if isSurgeTemplateFile(subscribeFile.TemplateFilename) {
-		surgeResult, serr := injectProxiesIntoSurgeTemplate(string(templateContent), proxies)
-		if serr != nil {
-			return nil, fmt.Errorf("生成 Surge 配置失败: %w", serr)
-		}
-		logger.Info("[模板生成] Surge 完成", "subscribe", subscribeFile.Name, "template", subscribeFile.TemplateFilename, "bytes", len(surgeResult))
-		return []byte(surgeResult), nil
-	}
-
-	processor := substore.NewTemplateV3Processor(nil, nil)
-	result, err := processor.ProcessTemplate(string(templateContent), proxies)
-	if err != nil {
-		return nil, fmt.Errorf("处理模板失败: %w", err)
-	}
-
-	result, err = injectProxiesIntoTemplate(result, proxies)
-	if err != nil {
-		return nil, fmt.Errorf("注入代理节点失败: %w", err)
-	}
-
-	// 孤儿节点裁剪:顶层 proxies: 只保留被 proxy-groups 实际引用的节点,删掉没被引用的
-	if pruned, perr := pruneUnreferencedProxies([]byte(result)); perr == nil {
-		result = string(pruned)
-	} else {
-		logger.Info("[模板生成] 孤儿裁剪跳过", "error", perr.Error())
-	}
-
-	logger.Info("[模板生成] 完成", "subscribe", subscribeFile.Name, "template", subscribeFile.TemplateFilename, "bytes", len(result))
-	return []byte(result), nil
-}
-
-func buildSubscriptionHeader(totalLimit, totalUsed int64) string {
+func buildSubscriptionHeader(totalLimit, totalUsed int64, expireAt *time.Time) string {
 	download := strconv.FormatInt(totalUsed, 10)
 	total := strconv.FormatInt(totalLimit, 10)
-	return "upload=0; download=" + download + "; total=" + total
+	expire := ""
+	if expireAt != nil {
+		expire = strconv.FormatInt(expireAt.Unix(), 10)
+	}
+	return "upload=0; download=" + download + "; total=" + total + "; expire=" + expire
 }
 
-// 将映射的键作为切片返回
+// getKeys returns the keys of a map as a slice
 func getKeys(m map[string]bool) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -1043,23 +1128,23 @@ func getKeys(m map[string]bool) []string {
 	return keys
 }
 
-// GetExternalSubscriptionsFromFile 从 YAML 文件内容中提取外部订阅 URL
-// 通过分析代理并查询数据库中的 raw_url（外部订阅链接）
-// 还检查引用外部订阅的代理提供程序配置的代理提供程序
+// GetExternalSubscriptionsFromFile extracts external subscription URLs from YAML file content
+// by analyzing proxies and querying the database for their raw_url (external subscription links)
+// Also checks proxy-providers for proxy provider configs that reference external subscriptions
 func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username string, repo *storage.TrafficRepository) (map[string]bool, error) {
 	usedURLs := make(map[string]bool)
 
-	// 解析 YAML 内容
+	// Parse YAML content
 	var yamlContent map[string]any
 	if err := yaml.Unmarshal(data, &yamlContent); err != nil {
 		return usedURLs, fmt.Errorf("failed to parse YAML: %w", err)
 	}
 
-	// 提取代理并查询数据库以获取其 raw_url
+	// Extract proxies and query database for their raw_url
 	if proxies, ok := yamlContent["proxies"].([]any); ok {
 		logger.Info("[Subscription] 找到订阅文件中的代理节点", "count", len(proxies))
 
-		// 收集所有代理名称
+		// Collect all proxy names
 		proxyNames := make(map[string]bool)
 		for _, proxy := range proxies {
 			if proxyMap, ok := proxy.(map[string]any); ok {
@@ -1072,55 +1157,27 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 		if len(proxyNames) > 0 {
 			logger.Info("[Subscription] 查询数据库获取外部订阅URL", "proxy_count", len(proxyNames))
 
-			// 查询数据库中具有这些名称的节点
+			// Query database for nodes with these names
 			nodes, err := repo.ListNodes(ctx, username)
 			if err != nil {
 				logger.Info("[Subscription] 查询节点列表失败", "error", err)
 				return usedURLs, fmt.Errorf("failed to list nodes: %w", err)
 			}
 
-			// 收集使用到的外部订阅标签（节点的 Tag 字段）
-			usedTags := make(map[string]bool)
-
-			// 查找匹配的节点并收集其 raw_url 和标签
+			// Find matching nodes and collect their raw_url
 			for _, node := range nodes {
 				if proxyNames[node.NodeName] {
-					// 如果节点有 RawURL，直接使用
 					if node.RawURL != "" {
 						usedURLs[node.RawURL] = true
 						logger.Info("[Subscription] 从节点找到外部订阅URL", "node_name", node.NodeName, "url", node.RawURL)
-					}
-					// 如果节点有 Tag（外部订阅名称），记录下来
-					if node.Tag != "" && node.Tag != "手动输入" {
-						usedTags[node.Tag] = true
-						logger.Info("[Subscription] 节点来自外部订阅", "node_name", node.NodeName, "tag", node.Tag)
-					}
-				}
-			}
-
-			// 妙妙屋模式：通过节点的 Tag（外部订阅名称）找到外部订阅URL
-			if len(usedTags) > 0 {
-				logger.Info("[Subscription] 发现使用外部订阅的节点", "tag_count", len(usedTags))
-
-				// 获取所有外部订阅
-				externalSubs, err := repo.ListExternalSubscriptions(ctx, username)
-				if err != nil {
-					logger.Info("[Subscription] 获取外部订阅列表失败", "error", err)
-				} else {
-					// 根据 Tag（外部订阅名称）找到对应的 URL
-					for _, sub := range externalSubs {
-						if usedTags[sub.Name] {
-							usedURLs[sub.URL] = true
-							logger.Info("[Subscription] 从节点Tag找到外部订阅URL", "tag", sub.Name, "url", sub.URL)
-						}
 					}
 				}
 			}
 		}
 	}
 
-	// 另请检查代理组中引用代理提供程序配置的“使用”字段
-	// 这处理使用 proxy-providers + use 而不是直接代理的情况
+	// Also check proxy-groups for 'use' field referencing proxy provider configs
+	// This handles the case where proxy-providers + use is used instead of direct proxies
 	if proxyGroups, ok := yamlContent["proxy-groups"].([]any); ok {
 		logger.Info("[Subscription] 检查 proxy-groups", "group_count", len(proxyGroups))
 		providerNames := make(map[string]bool)
@@ -1156,25 +1213,25 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 		if len(allNames) > 0 {
 			logger.Info("[Subscription] 找到代理集合引用", "count", len(allNames), "from_use", len(providerNames), "from_groups", len(groupNames))
 
-			// 获取该用户的所有代理提供商配置
+			// Get all proxy provider configs for this user
 			configs, err := repo.ListProxyProviderConfigs(ctx, username)
 			if err != nil {
 				logger.Info("[Subscription] 查询代理集合配置失败", "error", err)
 			} else {
 				logger.Info("[Subscription] 查询到用户的代理集合配置", "count", len(configs))
-				// 获取地图配置 -> URL 的外部订阅
+				// Get external subscriptions to map config -> URL
 				externalSubs, err := repo.ListExternalSubscriptions(ctx, username)
 				if err != nil {
 					logger.Info("[Subscription] 获取外部订阅列表失败", "error", err)
 				} else {
 					logger.Info("[Subscription] 查询到用户的外部订阅", "count", len(externalSubs))
-					// 构建外部订阅ID -> URL映射
+					// Build external subscription ID -> URL map
 					subIDToURL := make(map[int64]string)
 					for _, sub := range externalSubs {
 						subIDToURL[sub.ID] = sub.URL
 					}
 
-					// 查找与名称匹配的配置并获取其外部订阅 URL
+					// Find configs that match the names and get their external subscription URLs
 					for _, config := range configs {
 						logger.Info("[Subscription] 检查配置", "config_name", config.Name, "external_sub_id", config.ExternalSubscriptionID, "process_mode", config.ProcessMode)
 						if allNames[config.Name] {
@@ -1243,15 +1300,16 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 	return usedURLs, nil
 }
 
-// 仅同步指定的外部订阅
+// syncReferencedExternalSubscriptions syncs only the specified external subscriptions
 func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.TrafficRepository, subscribeDir, username string, subsToSync []storage.ExternalSubscription) error {
 	if repo == nil || username == "" || len(subsToSync) == 0 {
 		return fmt.Errorf("invalid parameters")
 	}
 
-	// 获取用户设置以检查匹配规则
+	// Get user settings to check match rule
 	userSettings, err := repo.GetUserSettings(ctx, username)
 	if err != nil {
+		// If settings not found, use default match rule
 		userSettings.MatchRule = "node_name"
 		userSettings.SyncScope = "saved_only"
 		userSettings.KeepNodeName = true
@@ -1260,11 +1318,10 @@ func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.Traf
 
 	logger.Info("[Subscription] 用户需要同步的外部订阅", "user", username, "count", len(subsToSync), "match_rule", userSettings.MatchRule)
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+	// [安全] 同步的是用户创建的外部订阅 URL —— 走 SSRF 安全客户端,防内网/云元数据探测。
+	client := newSSRFSafeHTTPClient(30 * time.Second)
 
-	// 跟踪已同步的节点总数
+	// Track total nodes synced
 	totalNodesSynced := 0
 
 	for _, sub := range subsToSync {
@@ -1277,8 +1334,8 @@ func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.Traf
 
 		totalNodesSynced += nodeCount
 
-		// 更新上次同步时间和节点数
-		// 使用包含来自 parseAndUpdateTrafficInfo 的流量信息的 UpdatedSub
+		// Update last sync time and node count
+		// Use updatedSub which contains traffic info from parseAndUpdateTrafficInfo
 		now := time.Now()
 		updatedSub.LastSyncAt = &now
 		updatedSub.NodeCount = nodeCount
@@ -1307,6 +1364,26 @@ func syncReferencedExternalSubscriptions(ctx context.Context, repo *storage.Traf
 		logger.Info("[Subscription] 失效外部订阅内容缓存", "url", url)
 	}
 
+	// 获取所有代理集合配置，失效引用了这些外部订阅的代理集合缓存
+	configs, err := repo.ListProxyProviderConfigs(ctx, username)
+	if err == nil {
+		cache := GetProxyProviderCache()
+		invalidatedCount := 0
+		for _, config := range configs {
+			// 检查是否引用了刚刚同步的外部订阅
+			if syncedSubIDs[config.ExternalSubscriptionID] {
+				cache.Delete(config.ID)
+				invalidatedCount++
+				logger.Info("[Subscription] 失效代理集合缓存", "config_name", config.Name, "config_id", config.ID)
+			}
+		}
+		if invalidatedCount > 0 {
+			logger.Info("[Subscription] 代理集合缓存失效完成", "count", invalidatedCount)
+		}
+	} else {
+		logger.Info("[Subscription] 获取代理集合配置失败，无法失效缓存", "error", err)
+	}
+
 	return nil
 }
 
@@ -1325,17 +1402,17 @@ func (h *SubscriptionHandler) loadTokenInvalidContent() []byte {
 	return data
 }
 
-// 通过客户端类型转换提供令牌无效 YAML 内容
+// serveTokenInvalidResponse serves the token invalid YAML content with client type conversion
 func (h *SubscriptionHandler) serveTokenInvalidResponse(w http.ResponseWriter, r *http.Request) {
 	data := h.loadTokenInvalidContent()
 
 	// 根据参数t的类型调用substore的转换代码
-	clientType := strings.TrimSpace(r.URL.Query().Get("t"))
+	clientType := resolveClientType(r)
 	contentType := "text/yaml; charset=utf-8"
 	ext := ".yaml"
 
-	// 如果指定了客户端类型且不是clash/clashmeta，进行转换
-	if clientType != "" && clientType != "clash" && clientType != "clashmeta" {
+	// 如果指定了客户端类型且不是clash/clashmeta/clash-to-shadowrocket，进行转换
+	if clientType != "" && clientType != "clash" && clientType != "clashmeta" && clientType != "clash-to-shadowrocket" {
 		convertedData, err := h.convertSubscription(r.Context(), data, clientType)
 		if err != nil {
 			// 转换失败，记录日志但继续返回YAML
@@ -1361,18 +1438,6 @@ func (h *SubscriptionHandler) serveTokenInvalidResponse(w http.ResponseWriter, r
 		}
 	}
 
-	// 同主订阅端点:sysConfig 是 JSON 且当前是 YAML content-type 就转 JSON,保持格式一致
-	if h.repo != nil {
-		if sysCfg, err := h.repo.GetSystemConfig(r.Context()); err == nil && sysCfg.SubscriptionOutputFormat == "json" &&
-			(contentType == "text/yaml; charset=utf-8" || contentType == "text/yaml; charset=utf-8; charset=UTF-8") {
-			if jsonBytes, jsonErr := marshalSubscriptionJSON(data); jsonErr == nil {
-				data = jsonBytes
-				contentType = "application/json; charset=utf-8"
-				ext = ".json"
-			}
-		}
-	}
-
 	attachmentName := url.PathEscape("Token已失效" + ext)
 
 	w.Header().Set("Content-Type", contentType)
@@ -1383,9 +1448,11 @@ func (h *SubscriptionHandler) serveTokenInvalidResponse(w http.ResponseWriter, r
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 
-	logger.Info("[Token Invalid] 返回Token失效响应", "client_type", clientType)
+	// ⚠️ Token失效日志 - 方便管理员追踪无效访问
+	logger.Info("⚠️⚠️⚠️ [SUB_INVALID] Token失效或过期访问", "client_type", clientType)
 }
 
+// runPostFetchScript parses YAML data, executes an override script, and re-marshals the result.
 func (h *SubscriptionHandler) runPostFetchScript(ctx context.Context, script string, yamlData []byte) ([]byte, error) {
 	var rootNode yaml.Node
 	if err := yaml.Unmarshal(yamlData, &rootNode); err != nil {
@@ -1409,23 +1476,7 @@ func (h *SubscriptionHandler) runPostFetchScript(ctx context.Context, script str
 	return out, nil
 }
 
-// ConvertSubscription 将 YAML 订阅文件转换为指定的客户端格式
-// shadowrocketProducerFor 返回 shadowrocket 系列要用的 producer:
-//   - "shadowrocket"          → ShadowrocketProducer(节点转换)
-//   - "clash-to-shadowrocket" → ShadowrocketTemplateProducer(完整 clash→shadowrocket 配置)
-// 二者在工厂里都以 "shadowrocket" 注册(template 覆盖了 plain),无法按类型区分,故显式实例化。
-// 其它类型返回 nil,交由调用方走工厂。
-func shadowrocketProducerFor(clientType string) substore.Producer {
-	switch clientType {
-	case "shadowrocket":
-		return substore.NewShadowrocketProducer()
-	case "clash-to-shadowrocket":
-		return substore.NewShadowrocketTemplateProducer()
-	default:
-		return nil
-	}
-}
-
+// convertSubscription converts a YAML subscription file to the specified client format.
 func (h *SubscriptionHandler) convertSubscription(ctx context.Context, yamlData []byte, clientType string) ([]byte, error) {
 	// 使用 yaml.Node 解析, 解决值前导零的问题
 	var rootNode yaml.Node
@@ -1468,12 +1519,12 @@ func (h *SubscriptionHandler) convertSubscription(ctx context.Context, yamlData 
 		return h.convertClashToSurge(config, proxies)
 	}
 
-	// clash-to-loon 类型使用 BuildCompleteLoonConfig 生成完整的 Loon 配置(同步自 mmw v0.7.2 #84)
+	// clash-to-loon 类型使用 BuildCompleteLoonConfig 生成完整的 Loon 配置
 	if clientType == "clash-to-loon" {
 		return h.convertClashToLoon(config, proxies)
 	}
 
-	// clash-to-loon-kelee 使用 kelee 模板,只填充 Proxy 节点(同步自 mmw v0.7.2 #84)
+	// clash-to-loon-kelee 使用 kelee 模板，只填充 Proxy 节点
 	if clientType == "clash-to-loon-kelee" {
 		result, err := substore.BuildLoonKeleeConfig(proxies)
 		if err != nil {
@@ -1482,14 +1533,12 @@ func (h *SubscriptionHandler) convertSubscription(ctx context.Context, yamlData 
 		return []byte(result), nil
 	}
 
-	// shadowrocket / clash-to-shadowrocket 显式取对应 producer(工厂里两者都注册成 "shadowrocket",
-	// template 覆盖了 plain,只能显式实例化);其余类型走工厂。
-	producer := shadowrocketProducerFor(clientType)
-	if producer == nil {
-		producer, err = substore.GetDefaultFactory().GetProducer(clientType)
-		if err != nil {
-			return nil, fmt.Errorf("unsupported client type '%s': %w", clientType, err)
-		}
+	factory := substore.GetDefaultFactory()
+
+	// 根据客户端类型获取Producer
+	producer, err := factory.GetProducer(clientType)
+	if err != nil {
+		return nil, fmt.Errorf("unsupported client type '%s': %w", clientType, err)
 	}
 
 	// 调用Produce方法生成转换后的节点, 传入完整配置供需要的 Producer 使用（如 Stash）
@@ -1499,31 +1548,6 @@ func (h *SubscriptionHandler) convertSubscription(ctx context.Context, yamlData 
 		FullConfig:              config,
 		ClientCompatibilityMode: systemConfig.ClientCompatibilityMode,
 	}
-
-	// Surge 系客户端:逐节点探测被过滤的节点,打日志方便排查"订阅没节点"问题。
-	// Produce 内部静默 continue 跳过不支持的类型,不打任何日志。
-	if isSurgeClientType(clientType) {
-		surgeProducer := substore.NewSurgeProducer()
-		var filteredNodes []string
-		for _, p := range proxies {
-			if _, perr := surgeProducer.ProduceOne(p, "", &substore.ProduceOptions{}); perr != nil {
-				name, _ := p["name"].(string)
-				typ, _ := p["type"].(string)
-				filteredNodes = append(filteredNodes, fmt.Sprintf("%s(%s:%v)", name, typ, perr))
-			}
-		}
-		if len(filteredNodes) > 0 {
-			logger.Warn("[Surge订阅] 部分节点因类型不受 Surge 支持被过滤",
-				"filtered_count", len(filteredNodes), "total", len(proxies),
-				"client_type", clientType,
-				"nodes", strings.Join(filteredNodes, ", "))
-		}
-		if len(filteredNodes) == len(proxies) {
-			logger.Warn("[Surge订阅] 全部节点被过滤,订阅将没有任何节点",
-				"total", len(proxies), "client_type", clientType)
-		}
-	}
-
 	result, err := producer.Produce(proxies, "", opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to produce subscription: %w", err)
@@ -1538,7 +1562,7 @@ func (h *SubscriptionHandler) convertSubscription(ctx context.Context, yamlData 
 	}
 }
 
-// ConvertClashToSurge 使用规则将 Clash 配置转换为 Surge 格式
+// convertClashToSurge converts Clash config to Surge format with rules
 func (h *SubscriptionHandler) convertClashToSurge(config map[string]interface{}, proxies []substore.Proxy) ([]byte, error) {
 	// 解析 Clash 配置结构
 	clashConfig := &substore.ClashConfig{}
@@ -1661,24 +1685,6 @@ func (h *SubscriptionHandler) convertClashToSurge(config map[string]interface{},
 	}
 
 	// 使用 BuildCompleteSurgeConfig 生成完整 Surge 配置
-	// 先探测哪些节点会被过滤,打日志方便排查"订阅没节点"问题。
-	surgeProducerForLog := substore.NewSurgeProducer()
-	var clashToSurgeFiltered []string
-	for _, p := range proxies {
-		if _, perr := surgeProducerForLog.ProduceOne(p, "", &substore.ProduceOptions{}); perr != nil {
-			name, _ := p["name"].(string)
-			typ, _ := p["type"].(string)
-			clashToSurgeFiltered = append(clashToSurgeFiltered, fmt.Sprintf("%s(%s:%v)", name, typ, perr))
-		}
-	}
-	if len(clashToSurgeFiltered) > 0 {
-		logger.Warn("[clash-to-surge] 部分节点因类型不受 Surge 支持被过滤",
-			"filtered_count", len(clashToSurgeFiltered), "total", len(proxies),
-			"nodes", strings.Join(clashToSurgeFiltered, ", "))
-	}
-	if len(clashToSurgeFiltered) == len(proxies) {
-		logger.Warn("[clash-to-surge] 全部节点被过滤,订阅将没有任何节点", "total", len(proxies))
-	}
 	surgeConfig, err := substore.BuildCompleteSurgeConfig(clashConfig, proxies, nil, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build Surge config: %w", err)
@@ -1687,7 +1693,7 @@ func (h *SubscriptionHandler) convertClashToSurge(config map[string]interface{},
 	return []byte(surgeConfig), nil
 }
 
-// convertClashToLoon 把 Clash config 转成完整 Loon 配置(同步自 mmw v0.7.2 #84)
+// convertClashToLoon converts Clash config to Loon format with full config
 func (h *SubscriptionHandler) convertClashToLoon(config map[string]interface{}, proxies []substore.Proxy) ([]byte, error) {
 	clashConfig := &substore.ClashConfig{}
 
@@ -1710,37 +1716,35 @@ func (h *SubscriptionHandler) convertClashToLoon(config map[string]interface{}, 
 	// 解析 proxy-groups
 	if groupsRaw, ok := config["proxy-groups"].([]interface{}); ok {
 		for _, g := range groupsRaw {
-			gMap, ok := g.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			group := substore.ClashProxyGroup{}
-			if name, ok := gMap["name"].(string); ok {
-				group.Name = name
-			}
-			if gType, ok := gMap["type"].(string); ok {
-				group.Type = gType
-			}
-			if url, ok := gMap["url"].(string); ok {
-				group.URL = url
-			}
-			if interval, ok := gMap["interval"].(int); ok {
-				group.Interval = interval
-			}
-			if tolerance, ok := gMap["tolerance"].(int); ok {
-				group.Tolerance = tolerance
-			}
-			if strategy, ok := gMap["strategy"].(string); ok {
-				group.Strategy = strategy
-			}
-			if proxiesArr, ok := gMap["proxies"].([]interface{}); ok {
-				for _, p := range proxiesArr {
-					if pStr, ok := p.(string); ok {
-						group.Proxies = append(group.Proxies, pStr)
+			if gMap, ok := g.(map[string]interface{}); ok {
+				group := substore.ClashProxyGroup{}
+				if name, ok := gMap["name"].(string); ok {
+					group.Name = name
+				}
+				if gType, ok := gMap["type"].(string); ok {
+					group.Type = gType
+				}
+				if url, ok := gMap["url"].(string); ok {
+					group.URL = url
+				}
+				if interval, ok := gMap["interval"].(int); ok {
+					group.Interval = interval
+				}
+				if tolerance, ok := gMap["tolerance"].(int); ok {
+					group.Tolerance = tolerance
+				}
+				if strategy, ok := gMap["strategy"].(string); ok {
+					group.Strategy = strategy
+				}
+				if proxiesArr, ok := gMap["proxies"].([]interface{}); ok {
+					for _, p := range proxiesArr {
+						if pStr, ok := p.(string); ok {
+							group.Proxies = append(group.Proxies, pStr)
+						}
 					}
 				}
+				clashConfig.ProxyGroups = append(clashConfig.ProxyGroups, group)
 			}
-			clashConfig.ProxyGroups = append(clashConfig.ProxyGroups, group)
 		}
 	}
 
@@ -1757,30 +1761,28 @@ func (h *SubscriptionHandler) convertClashToLoon(config map[string]interface{}, 
 	if providersRaw, ok := config["rule-providers"].(map[string]interface{}); ok {
 		clashConfig.RuleProviders = make(map[string]substore.ClashRuleProvider)
 		for name, p := range providersRaw {
-			pMap, ok := p.(map[string]interface{})
-			if !ok {
-				continue
+			if pMap, ok := p.(map[string]interface{}); ok {
+				provider := substore.ClashRuleProvider{}
+				if pType, ok := pMap["type"].(string); ok {
+					provider.Type = pType
+				}
+				if behavior, ok := pMap["behavior"].(string); ok {
+					provider.Behavior = behavior
+				}
+				if url, ok := pMap["url"].(string); ok {
+					provider.URL = url
+				}
+				if path, ok := pMap["path"].(string); ok {
+					provider.Path = path
+				}
+				if interval, ok := pMap["interval"].(int); ok {
+					provider.Interval = interval
+				}
+				if format, ok := pMap["format"].(string); ok {
+					provider.Format = format
+				}
+				clashConfig.RuleProviders[name] = provider
 			}
-			provider := substore.ClashRuleProvider{}
-			if pType, ok := pMap["type"].(string); ok {
-				provider.Type = pType
-			}
-			if behavior, ok := pMap["behavior"].(string); ok {
-				provider.Behavior = behavior
-			}
-			if url, ok := pMap["url"].(string); ok {
-				provider.URL = url
-			}
-			if path, ok := pMap["path"].(string); ok {
-				provider.Path = path
-			}
-			if interval, ok := pMap["interval"].(int); ok {
-				provider.Interval = interval
-			}
-			if format, ok := pMap["format"].(string); ok {
-				provider.Format = format
-			}
-			clashConfig.RuleProviders[name] = provider
 		}
 	}
 
@@ -1792,7 +1794,7 @@ func (h *SubscriptionHandler) convertClashToLoon(config map[string]interface{}, 
 	return []byte(loonConfig), nil
 }
 
-// 修复 WireGuard 节点的 allowed-ips 字段类型
+// fixWireGuardAllowedIPs fixes allowed-ips field type for WireGuard nodes
 func fixWireGuardAllowedIPs(proxiesNode *yaml.Node) {
 	if proxiesNode == nil || proxiesNode.Kind != yaml.SequenceNode {
 		return
@@ -1803,7 +1805,7 @@ func fixWireGuardAllowedIPs(proxiesNode *yaml.Node) {
 			continue
 		}
 
-		// 检查这是否是 WireGuard 节点
+		// Check if this is a WireGuard node
 		isWireGuard := false
 		for i := 0; i < len(proxyNode.Content); i += 2 {
 			if i+1 >= len(proxyNode.Content) {
@@ -1819,7 +1821,7 @@ func fixWireGuardAllowedIPs(proxiesNode *yaml.Node) {
 			continue
 		}
 
-		// 修复 allowed-ips 字段
+		// Fix allowed-ips field
 		for i := 0; i < len(proxyNode.Content); i += 2 {
 			if i+1 >= len(proxyNode.Content) {
 				break
@@ -1828,18 +1830,18 @@ func fixWireGuardAllowedIPs(proxiesNode *yaml.Node) {
 			valueNode := proxyNode.Content[i+1]
 
 			if keyNode.Value == "allowed-ips" {
-				// 如果它已经是序列节点，只需清除所有字符串标签
+				// If it's already a sequence node, just clear any string tags
 				if valueNode.Kind == yaml.SequenceNode {
 					valueNode.Tag = ""
 					valueNode.Style = 0
-					// 还清除子节点的标签
+					// Also clear tags from child nodes
 					for _, childNode := range valueNode.Content {
 						if childNode.Tag == "!!str" {
 							childNode.Tag = ""
 						}
 					}
 				} else if valueNode.Kind == yaml.ScalarNode {
-					// 如果它是带有 !!str 标签的标量或看起来像 JSON 数组，请清除该标签
+					// If it's a scalar with !!str tag or looks like a JSON array, clear the tag
 					if valueNode.Tag == "!!str" || valueNode.Tag == "tag:yaml.org,2002:str" {
 						valueNode.Tag = ""
 						valueNode.Style = 0
@@ -1851,13 +1853,13 @@ func fixWireGuardAllowedIPs(proxiesNode *yaml.Node) {
 	}
 }
 
-// 重新排序序列节点中每个代理的字段
+// reorderProxies reorders each proxy's fields in the sequence node
 func reorderProxies(seqNode *yaml.Node) {
 	if seqNode == nil || seqNode.Kind != yaml.SequenceNode {
 		return
 	}
 
-	// 处理序列中的每个代理
+	// Process each proxy in the sequence
 	for _, proxyNode := range seqNode.Content {
 		if proxyNode.Kind == yaml.MappingNode {
 			reorderProxyNode(proxyNode)
@@ -1865,22 +1867,22 @@ func reorderProxies(seqNode *yaml.Node) {
 	}
 }
 
-// reorderProxyNode 重新排序代理配置字段
-// 优先顺序：名称、类型、服务器、端口，然后是所有其他字段
+// reorderProxyNode reorders proxy configuration fields
+// Priority order: name, type, server, port, then all other fields
 func reorderProxyNode(proxyNode *yaml.Node) {
 	if proxyNode == nil || proxyNode.Kind != yaml.MappingNode {
 		return
 	}
 
-	// 按所需顺序排列优先级字段
+	// Priority fields in desired order
 	priorityFields := []string{"name", "type", "server", "port"}
 
-	// 创建现有字段的地图
+	// Create a map of existing fields
 	fieldMap := make(map[string]*yaml.Node)
-	fieldKeyNodes := make(map[string]*yaml.Node) // 存储原始关键节点以保留风格
+	fieldKeyNodes := make(map[string]*yaml.Node) // Store original key nodes to preserve style
 	remainingFields := []*yaml.Node{}
 
-	// 解析现有字段
+	// Parse existing fields
 	for i := 0; i < len(proxyNode.Content); i += 2 {
 		if i+1 >= len(proxyNode.Content) {
 			break
@@ -1888,18 +1890,18 @@ func reorderProxyNode(proxyNode *yaml.Node) {
 		keyNode := proxyNode.Content[i]
 		valueNode := proxyNode.Content[i+1]
 
-		// 对 allowed-ips 字段进行特殊处理，以确保将其视为数组
+		// Special handling for allowed-ips field to ensure it's treated as an array
 		if keyNode.Value == "allowed-ips" && valueNode.Kind == yaml.ScalarNode {
-			// 如果它是一个看起来像 JSON 数组的标量字符串，请显式标记它
+			// If it's a scalar string that looks like a JSON array, mark it explicitly
 			if valueNode.Tag == "!!str" || (valueNode.Style == yaml.DoubleQuotedStyle &&
 				len(valueNode.Value) > 0 && valueNode.Value[0] == '[') {
-				// 删除 !!str 标签并让 YAML 推断类型
+				// Remove the !!str tag and let YAML infer the type
 				valueNode.Tag = ""
 				valueNode.Style = 0
 			}
 		}
 
-		// 检查这是否是优先字段
+		// Check if this is a priority field
 		isPriority := false
 		for _, pf := range priorityFields {
 			if keyNode.Value == pf {
@@ -1910,19 +1912,19 @@ func reorderProxyNode(proxyNode *yaml.Node) {
 			}
 		}
 
-		// 如果不是优先级字段，请保存键和值以供以后使用
+		// If not a priority field, save both key and value for later
 		if !isPriority {
 			remainingFields = append(remainingFields, keyNode, valueNode)
 		}
 	}
 
-	// 使用有序字段重建内容
+	// Rebuild the Content with ordered fields
 	newContent := []*yaml.Node{}
 
-	// 首先添加优先级字段（按顺序）
+	// Add priority fields first (in order)
 	for _, fieldName := range priorityFields {
 		if valueNode, exists := fieldMap[fieldName]; exists {
-			// 如果可用，则使用原始关键节点，否则创建新的
+			// Use original key node if available, otherwise create new one
 			keyNode := fieldKeyNodes[fieldName]
 			if keyNode == nil {
 				keyNode = &yaml.Node{
@@ -1934,20 +1936,20 @@ func reorderProxyNode(proxyNode *yaml.Node) {
 		}
 	}
 
-	// 添加剩余字段
+	// Add remaining fields
 	newContent = append(newContent, remainingFields...)
 
-	// 替换原来的内容
+	// Replace the original content
 	proxyNode.Content = newContent
 }
 
-// 重新排序序列节点中每个代理组的字段
+// reorderProxyGroups reorders each proxy group's fields in the sequence node
 func reorderProxyGroups(seqNode *yaml.Node) {
 	if seqNode == nil || seqNode.Kind != yaml.SequenceNode {
 		return
 	}
 
-	// 按顺序处理每个代理组
+	// Process each proxy group in the sequence
 	for _, groupNode := range seqNode.Content {
 		if groupNode.Kind == yaml.MappingNode {
 			reorderProxyGroupFields(groupNode)
@@ -1955,215 +1957,21 @@ func reorderProxyGroups(seqNode *yaml.Node) {
 	}
 }
 
-// injectDialerProxyFromGroups 读 proxy-groups 中各组的 dialer-proxy-group 字段,
-// 给该组 proxies 数组里的"叶子节点名"在顶层 proxies 加 dialer-proxy: <值>。
-//   - 已有 dialer-proxy 的节点跳过(尊重链式代理 chain_proxy_node_id 注入的)
-//   - 引用的 dialer-proxy-group 必须是已存在的代理组,否则跳过
-//   - DIRECT / REJECT / PASS 跳过
-//   - 同节点被多组绑定时,按 proxy-groups 出现顺序取第一个
-func injectDialerProxyFromGroups(rootMap *yaml.Node) {
-	var proxyGroupsNode, proxiesNode *yaml.Node
-	for i := 0; i < len(rootMap.Content)-1; i += 2 {
-		switch rootMap.Content[i].Value {
-		case "proxy-groups":
-			proxyGroupsNode = rootMap.Content[i+1]
-		case "proxies":
-			proxiesNode = rootMap.Content[i+1]
-		}
-	}
-	if proxyGroupsNode == nil || proxyGroupsNode.Kind != yaml.SequenceNode {
-		return
-	}
-	if proxiesNode == nil || proxiesNode.Kind != yaml.SequenceNode {
-		return
-	}
-
-	groupNames := make(map[string]bool)
-	type groupInfo struct {
-		dialerGroup string
-		proxies     []string
-	}
-	groups := make(map[string]*groupInfo)
-	var orderedGroupNames []string
-	for _, gNode := range proxyGroupsNode.Content {
-		if gNode.Kind != yaml.MappingNode {
-			continue
-		}
-		var name, dialerGroup string
-		var pxList []string
-		for i := 0; i < len(gNode.Content)-1; i += 2 {
-			switch gNode.Content[i].Value {
-			case "name":
-				name = gNode.Content[i+1].Value
-			case "dialer-proxy-group":
-				dialerGroup = gNode.Content[i+1].Value
-			case "proxies":
-				if gNode.Content[i+1].Kind == yaml.SequenceNode {
-					for _, pn := range gNode.Content[i+1].Content {
-						pxList = append(pxList, pn.Value)
-					}
-				}
-			}
-		}
-		if name == "" {
-			continue
-		}
-		groupNames[name] = true
-		groups[name] = &groupInfo{dialerGroup: dialerGroup, proxies: pxList}
-		orderedGroupNames = append(orderedGroupNames, name)
-	}
-
-	isBuiltIn := func(v string) bool { return v == "DIRECT" || v == "REJECT" || v == "PASS" }
-	nameToDialer := make(map[string]string)
-	for _, name := range orderedGroupNames {
-		info := groups[name]
-		if info.dialerGroup == "" || !groupNames[info.dialerGroup] {
-			continue
-		}
-		for _, p := range info.proxies {
-			if isBuiltIn(p) || groupNames[p] {
-				continue
-			}
-			if _, dup := nameToDialer[p]; !dup {
-				nameToDialer[p] = info.dialerGroup
-			}
-		}
-	}
-	if len(nameToDialer) == 0 {
-		return
-	}
-
-	for _, pNode := range proxiesNode.Content {
-		if pNode.Kind != yaml.MappingNode {
-			continue
-		}
-		var pName string
-		hasDialerAlready := false
-		for i := 0; i < len(pNode.Content)-1; i += 2 {
-			switch pNode.Content[i].Value {
-			case "name":
-				pName = pNode.Content[i+1].Value
-			case "dialer-proxy":
-				hasDialerAlready = true
-			}
-		}
-		if hasDialerAlready {
-			continue
-		}
-		target, ok := nameToDialer[pName]
-		if !ok {
-			continue
-		}
-		pNode.Content = append(pNode.Content,
-			&yaml.Node{Kind: yaml.ScalarNode, Value: "dialer-proxy"},
-			&yaml.Node{Kind: yaml.ScalarNode, Value: target},
-		)
-	}
-}
-
-// pruneUnreferencedProxies 解析模板订阅生成的 YAML,把顶层 proxies: 数组里"未被任何 proxy-group 引用"的节点删掉。
-// 复用 substore.CollectUsedProxyNamesFromGroups 拿 used 集合,然后过滤 proxies.Content。
-// 无 proxy-groups / used 集合为空(理论上不应该,但若发生) → 不裁剪,原样返回。
-// 解析失败 / 重新 Marshal 失败 → 返回原数据 + error,调用方决定是否 fallback。
-func pruneUnreferencedProxies(data []byte) ([]byte, error) {
-	if len(data) == 0 {
-		return data, nil
-	}
-	var root yaml.Node
-	if err := yaml.Unmarshal(data, &root); err != nil {
-		return data, err
-	}
-	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
-		return data, nil
-	}
-	doc := root.Content[0]
-
-	var proxiesNode, groupsNode *yaml.Node
-	for i := 0; i < len(doc.Content)-1; i += 2 {
-		switch doc.Content[i].Value {
-		case "proxies":
-			proxiesNode = doc.Content[i+1]
-		case "proxy-groups":
-			groupsNode = doc.Content[i+1]
-		}
-	}
-	if groupsNode == nil || proxiesNode == nil || proxiesNode.Kind != yaml.SequenceNode {
-		return data, nil
-	}
-
-	used := substore.CollectUsedProxyNamesFromGroups(groupsNode)
-	if len(used) == 0 {
-		return data, nil
-	}
-
-	kept := make([]*yaml.Node, 0, len(proxiesNode.Content))
-	removed := 0
-	for _, item := range proxiesNode.Content {
-		if item.Kind != yaml.MappingNode {
-			kept = append(kept, item)
-			continue
-		}
-		var name string
-		for j := 0; j < len(item.Content)-1; j += 2 {
-			if item.Content[j].Value == "name" {
-				name = item.Content[j+1].Value
-				break
-			}
-		}
-		if name == "" || used[name] {
-			kept = append(kept, item)
-		} else {
-			removed++
-		}
-	}
-	if removed == 0 {
-		return data, nil
-	}
-	proxiesNode.Content = kept
-
-	out, err := MarshalYAMLWithIndent(&root)
-	if err != nil {
-		return data, err
-	}
-	return []byte(RemoveUnicodeEscapeQuotes(string(out))), nil
-}
-
-// stripDialerProxyGroup 把每个代理组的 dialer-proxy-group 字段移除
-// (MMW 自定义字段,不应出现在客户端订阅响应里)。
-func stripDialerProxyGroup(proxyGroupsNode *yaml.Node) {
-	if proxyGroupsNode == nil || proxyGroupsNode.Kind != yaml.SequenceNode {
-		return
-	}
-	for _, groupNode := range proxyGroupsNode.Content {
-		if groupNode.Kind != yaml.MappingNode {
-			continue
-		}
-		newContent := make([]*yaml.Node, 0, len(groupNode.Content))
-		for i := 0; i < len(groupNode.Content)-1; i += 2 {
-			if groupNode.Content[i].Value == "dialer-proxy-group" {
-				continue
-			}
-			newContent = append(newContent, groupNode.Content[i], groupNode.Content[i+1])
-		}
-		groupNode.Content = newContent
-	}
-}
-
-// reorderProxyGroupFields 重新排序代理组配置字段
-// 优先级顺序：名称、类型、策略、代理、url、间隔、容差、惰性、隐藏
+// reorderProxyGroupFields reorders proxy group configuration fields
+// Priority order: name, type, strategy, proxies, url, interval, tolerance, lazy, hidden
 func reorderProxyGroupFields(groupNode *yaml.Node) {
 	if groupNode == nil || groupNode.Kind != yaml.MappingNode {
 		return
 	}
 
-	// 按所需顺序排列优先级字段
+	// Priority fields in desired order
 	priorityFields := []string{"name", "type", "strategy", "proxies", "url", "interval", "tolerance", "lazy", "hidden"}
 
-	// 创建现有字段的地图
+	// Create a map of existing fields
 	fieldMap := make(map[string]*yaml.Node)
 	remainingFields := []*yaml.Node{}
 
-	// 解析现有字段
+	// Parse existing fields
 	for i := 0; i < len(groupNode.Content); i += 2 {
 		if i+1 >= len(groupNode.Content) {
 			break
@@ -2171,7 +1979,7 @@ func reorderProxyGroupFields(groupNode *yaml.Node) {
 		keyNode := groupNode.Content[i]
 		valueNode := groupNode.Content[i+1]
 
-		// 检查这是否是优先字段
+		// Check if this is a priority field
 		isPriority := false
 		for _, pf := range priorityFields {
 			if keyNode.Value == pf {
@@ -2181,16 +1989,16 @@ func reorderProxyGroupFields(groupNode *yaml.Node) {
 			}
 		}
 
-		// 如果不是优先级字段，请保存键和值以供以后使用
+		// If not a priority field, save both key and value for later
 		if !isPriority {
 			remainingFields = append(remainingFields, keyNode, valueNode)
 		}
 	}
 
-	// 使用有序字段重建内容
+	// Rebuild the Content with ordered fields
 	newContent := []*yaml.Node{}
 
-	// 首先添加优先级字段（按顺序）
+	// Add priority fields first (in order)
 	for _, fieldName := range priorityFields {
 		if valueNode, exists := fieldMap[fieldName]; exists {
 			keyNode := &yaml.Node{
@@ -2201,55 +2009,271 @@ func reorderProxyGroupFields(groupNode *yaml.Node) {
 		}
 	}
 
-	// 添加剩余字段
+	// Add remaining fields
 	newContent = append(newContent, remainingFields...)
 
-	// 替换原来的内容
+	// Replace the original content
 	groupNode.Content = newContent
 }
 
-// orderNodesByUserOrder 按用户 nodeOrder 重排 storage.Node 数组,顺序逻辑跟
-// PackageSubscribeHandler.orderPackageNodes 一致:user.NodeOrder 非空按其位置排;
-// 空时 fallback admin 顺序;不在 nodeOrder 里的(新节点)按原 nodes 顺序追加末尾。
-// 用于模板订阅生成路径,影响 __PROXY_NODES__ 占位符展开顺序 + 顶层 proxies 顺序。
-func orderNodesByUserOrder(ctx context.Context, repo *storage.TrafficRepository, username string, nodes []storage.Node) []storage.Node {
-	if len(nodes) == 0 || username == "" {
-		return nodes
-	}
-	var nodeOrder []int64
-	if settings, err := repo.GetUserSettings(ctx, username); err == nil {
-		nodeOrder = settings.NodeOrder
-	}
-	if len(nodeOrder) == 0 {
-		nodeOrder = computeFallbackNodeOrder(ctx, repo, username)
-	}
-	if len(nodeOrder) == 0 {
-		return nodes
-	}
+// injectLegacyDialerProxy 兼容旧链式代理配置：
+// 当 proxy-groups 中同时存在 "🌄 落地节点" 和 "🌠 中转节点" 时，
+// 给落地节点组内的所有 proxy 自动添加 dialer-proxy: 🌠 中转节点（已有则跳过）
+func injectLegacyDialerProxy(rootMap *yaml.Node) {
+	const landingGroup = "🌄 落地节点"
+	const relayGroup = "🌠 中转节点"
 
-	byID := make(map[int64]storage.Node, len(nodes))
-	for _, n := range nodes {
-		byID[n.ID] = n
-	}
-	orderPos := make(map[int64]int, len(nodeOrder))
-	for i, id := range nodeOrder {
-		orderPos[id] = i
-	}
-
-	ordered := make([]storage.Node, 0, len(nodes))
-	// 在 nodeOrder 里的节点按位置排
-	for _, id := range nodeOrder {
-		if n, ok := byID[id]; ok {
-			ordered = append(ordered, n)
+	// 查找 proxy-groups
+	var proxyGroupsNode *yaml.Node
+	for i := 0; i < len(rootMap.Content); i += 2 {
+		if rootMap.Content[i].Value == "proxy-groups" {
+			proxyGroupsNode = rootMap.Content[i+1]
+			break
 		}
 	}
-	// 不在 nodeOrder 里的节点(管理员新加的)按 nodes 原顺序追加末尾
-	for _, n := range nodes {
-		if _, inOrder := orderPos[n.ID]; !inOrder {
-			ordered = append(ordered, n)
+	if proxyGroupsNode == nil || proxyGroupsNode.Kind != yaml.SequenceNode {
+		return
+	}
+
+	// 收集落地节点组的 proxies 名称，同时确认中转节点组存在
+	hasRelay := false
+	landingProxies := make(map[string]bool)
+	for _, groupNode := range proxyGroupsNode.Content {
+		if groupNode.Kind != yaml.MappingNode {
+			continue
+		}
+		name := yamlMapGet(groupNode, "name")
+		if name == relayGroup {
+			hasRelay = true
+		}
+		if name == landingGroup {
+			for i := 0; i < len(groupNode.Content); i += 2 {
+				if groupNode.Content[i].Value == "proxies" && groupNode.Content[i+1].Kind == yaml.SequenceNode {
+					for _, pNode := range groupNode.Content[i+1].Content {
+						landingProxies[pNode.Value] = true
+					}
+				}
+			}
 		}
 	}
-	return ordered
+	if !hasRelay || len(landingProxies) == 0 {
+		return
+	}
+
+	// 查找 proxies 节点，给命中的节点注入 dialer-proxy
+	for i := 0; i < len(rootMap.Content); i += 2 {
+		if rootMap.Content[i].Value != "proxies" {
+			continue
+		}
+		proxiesNode := rootMap.Content[i+1]
+		if proxiesNode.Kind != yaml.SequenceNode {
+			break
+		}
+		for _, proxyNode := range proxiesNode.Content {
+			if proxyNode.Kind != yaml.MappingNode {
+				continue
+			}
+			proxyName := yamlMapGet(proxyNode, "name")
+			if !landingProxies[proxyName] {
+				continue
+			}
+			// 已有 dialer-proxy 则跳过
+			if yamlMapGet(proxyNode, "dialer-proxy") != "" {
+				continue
+			}
+			proxyNode.Content = append(proxyNode.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "dialer-proxy"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: relayGroup},
+			)
+		}
+		break
+	}
+}
+
+func injectRelayGroups(ctx context.Context, repo *storage.TrafficRepository, username string, rootMap *yaml.Node) {
+	nodes, err := repo.ListNodes(ctx, username)
+	if err != nil {
+		return
+	}
+
+	nodeByID := make(map[int64]storage.Node, len(nodes))
+	for _, n := range nodes {
+		nodeByID[n.ID] = n
+	}
+
+	// 定位订阅文件中的 proxies 序列，并收集已存在的节点名（落地节点）
+	var proxiesNode *yaml.Node
+	for i := 0; i < len(rootMap.Content); i += 2 {
+		if rootMap.Content[i].Value == "proxies" {
+			if rootMap.Content[i+1].Kind == yaml.SequenceNode {
+				proxiesNode = rootMap.Content[i+1]
+			}
+			break
+		}
+	}
+	if proxiesNode == nil {
+		return
+	}
+	existingNames := make(map[string]bool)
+	for _, pn := range proxiesNode.Content {
+		if pn.Kind == yaml.MappingNode {
+			existingNames[yamlMapGet(pn, "name")] = true
+		}
+	}
+
+	// 仅处理“落地（源）节点已存在于订阅中”的中转组：
+	// 注入 dialer-proxy、按需把缺失的底层节点补入 proxies、生成中转代理组
+	type relayInfo struct {
+		groupName string
+		proxies   []string
+	}
+	relayMap := make(map[string]*relayInfo)
+	relayBySource := make(map[string]string) // 源节点名 -> 组名
+	for _, n := range nodes {
+		if n.RelayGroupName == "" || len(n.RelayGroupNodeIDs) == 0 {
+			continue
+		}
+		if !existingNames[n.NodeName] {
+			continue // 落地节点不在订阅里，不插入中转组
+		}
+		relayBySource[n.NodeName] = n.RelayGroupName
+		if _, exists := relayMap[n.RelayGroupName]; exists {
+			continue
+		}
+		var members []string
+		for _, rid := range n.RelayGroupNodeIDs {
+			member, ok := nodeByID[rid]
+			if !ok || !member.Enabled {
+				continue // 底层节点已删除或被禁用：剔除，避免悬空引用
+			}
+			members = append(members, member.NodeName)
+			// 底层节点定义若不在订阅里，从节点表补入根 proxies
+			if !existingNames[member.NodeName] {
+				var pc map[string]any
+				if err := json.Unmarshal([]byte(member.ClashConfig), &pc); err != nil {
+					continue
+				}
+				pc["name"] = member.NodeName
+				proxiesNode.Content = append(proxiesNode.Content, mapToYAMLNode(pc))
+				existingNames[member.NodeName] = true
+			}
+		}
+		if len(members) > 0 {
+			relayMap[n.RelayGroupName] = &relayInfo{groupName: n.RelayGroupName, proxies: members}
+		}
+	}
+	if len(relayMap) == 0 {
+		return
+	}
+
+	// 给落地（源）节点注入 dialer-proxy
+	for _, proxyNode := range proxiesNode.Content {
+		if proxyNode.Kind != yaml.MappingNode {
+			continue
+		}
+		groupName, ok := relayBySource[yamlMapGet(proxyNode, "name")]
+		if !ok {
+			continue
+		}
+		if yamlMapGet(proxyNode, "dialer-proxy") != "" {
+			continue
+		}
+		proxyNode.Content = append(proxyNode.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Value: "dialer-proxy"},
+			&yaml.Node{Kind: yaml.ScalarNode, Value: groupName},
+		)
+	}
+
+	// 追加中转代理组到 proxy-groups
+	for i := 0; i < len(rootMap.Content); i += 2 {
+		if rootMap.Content[i].Value != "proxy-groups" {
+			continue
+		}
+		groupsNode := rootMap.Content[i+1]
+		if groupsNode.Kind != yaml.SequenceNode {
+			break
+		}
+		for _, r := range relayMap {
+			groupNode := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			groupNode.Content = append(groupNode.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "name"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: r.groupName},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "type"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "url-test"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "url"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "http://www.gstatic.com/generate_204"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "interval"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "300", Tag: "!!int"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "tolerance"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "50", Tag: "!!int"},
+			)
+			proxiesSeq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+			for _, p := range r.proxies {
+				proxiesSeq.Content = append(proxiesSeq.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: p})
+			}
+			groupNode.Content = append(groupNode.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "proxies"},
+				proxiesSeq,
+			)
+			groupsNode.Content = append(groupsNode.Content, groupNode)
+		}
+		break
+	}
+}
+
+// yamlMapGet 从 MappingNode 中读取指定 key 的字符串值
+func yamlMapGet(node *yaml.Node, key string) string {
+	for i := 0; i < len(node.Content)-1; i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1].Value
+		}
+	}
+	return ""
+}
+
+// stripDialerProxyGroup 从 proxy-groups 中移除 dialer-proxy-group 字段（仅用于 API 输出）
+func stripDialerProxyGroup(proxyGroupsNode *yaml.Node) {
+	for _, groupNode := range proxyGroupsNode.Content {
+		if groupNode.Kind != yaml.MappingNode {
+			continue
+		}
+		newContent := make([]*yaml.Node, 0, len(groupNode.Content))
+		for i := 0; i < len(groupNode.Content); i += 2 {
+			if i+1 >= len(groupNode.Content) {
+				break
+			}
+			if groupNode.Content[i].Value == "dialer-proxy-group" {
+				continue
+			}
+			newContent = append(newContent, groupNode.Content[i], groupNode.Content[i+1])
+		}
+		groupNode.Content = newContent
+	}
+}
+
+// sortNodesByNodeOrder 根据用户配置的节点顺序对 storage.Node 切片进行排序
+func sortNodesByNodeOrder(nodes []storage.Node, nodeOrder []int64) {
+	if len(nodeOrder) == 0 || len(nodes) == 0 {
+		return
+	}
+
+	nodeIDToPosition := make(map[int64]int, len(nodeOrder))
+	for pos, nodeID := range nodeOrder {
+		nodeIDToPosition[nodeID] = pos
+	}
+
+	sort.SliceStable(nodes, func(i, j int) bool {
+		posI, foundI := nodeIDToPosition[nodes[i].ID]
+		posJ, foundJ := nodeIDToPosition[nodes[j].ID]
+
+		if !foundI {
+			return false
+		}
+		if !foundJ {
+			return true
+		}
+		return posI < posJ
+	})
 }
 
 // sortProxiesByNodeOrder 根据用户配置的节点顺序对 proxies 进行排序
@@ -2263,16 +2287,11 @@ func sortProxiesByNodeOrder(ctx context.Context, repo *storage.TrafficRepository
 		return nil
 	}
 
-	// 拿全节点的 name→ID 映射:
-	// 老逻辑 ListNodes(username) 只返该 username 名下的节点 — 普通用户(share 等)自己没创建节点,
-	// 套餐节点是 admin 创建的(username=admin),share 名下查到 0 行 → nodeNameToID 空 →
-	// 每个 proxy.name 在排序时找不到 ID,position 全 -1,nodeOrder 完全不生效。
-	// 用 ListAllNodes:name→ID 映射跟权限无关,nodeOrder 里的 ID 都能查到,排序正确。
-	nodes, err := repo.ListAllNodes(ctx)
+	// 获取用户的所有节点信息
+	nodes, err := repo.ListNodes(ctx, username)
 	if err != nil {
 		return fmt.Errorf("failed to list nodes: %w", err)
 	}
-	_ = username
 
 	// 创建节点名称 -> 节点ID 的映射
 	nodeNameToID := make(map[string]int64)
@@ -2368,93 +2387,405 @@ func sortProxiesByNodeOrder(ctx context.Context, repo *storage.TrafficRepository
 	return nil
 }
 
-func injectChainProxy(ctx context.Context, repo *storage.TrafficRepository, username string, data []byte) []byte {
-	nodes, err := repo.ListNodes(ctx, username)
+// generateFromTemplate 基于绑定的 V3 模板生成订阅配置
+// 代理节点来源：节点表（nodes），代理集合来源：代理集合表（proxy_provider_configs）
+func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, username string, subscribeFile storage.SubscribeFile) ([]byte, error) {
+	if subscribeFile.TemplateFilename == "" {
+		return nil, errors.New("订阅未绑定模板")
+	}
+
+	// 1. 读取模板文件
+	templatePath := filepath.Join("rule_templates", subscribeFile.TemplateFilename)
+	templateContent, err := os.ReadFile(templatePath)
 	if err != nil {
-		return data
+		return nil, fmt.Errorf("读取模板文件失败: %w", err)
+	}
+	logger.Info("[模板生成] 读取模板文件", "template", subscribeFile.TemplateFilename, "bytes", len(templateContent))
+
+	// 2. 从节点表获取代理节点（非管理员使用管理员的节点）
+	nodeOwner := username
+	if user, err := h.repo.GetUser(ctx, username); err == nil && user.Role != storage.RoleAdmin {
+		if adminName, err := h.repo.GetAdminUsername(ctx); err == nil {
+			nodeOwner = adminName
+		}
+	}
+	nodes, err := h.repo.ListNodes(ctx, nodeOwner)
+	if err != nil {
+		return nil, fmt.Errorf("获取节点列表失败: %w", err)
+	}
+
+	// 按用户配置的节点顺序排序
+	if settings, err := h.repo.GetUserSettings(ctx, username); err == nil && len(settings.NodeOrder) > 0 {
+		sortNodesByNodeOrder(nodes, settings.NodeOrder)
+	}
+
+	// 构建选中标签的 map 用于快速查找
+	selectedTagsMap := make(map[string]bool)
+	for _, tag := range subscribeFile.SelectedTags {
+		selectedTagsMap[tag] = true
+	}
+	hasTagFilter := len(selectedTagsMap) > 0
+
+	// 构建节点 ID -> 名称映射（用于链式代理解析）
+	nodeIDToName := make(map[int64]string, len(nodes))
+	// 构建节点 ID -> 节点映射（用于中转组底层节点补全）
+	nodeByID := make(map[int64]storage.Node, len(nodes))
+	for _, node := range nodes {
+		nodeIDToName[node.ID] = node.NodeName
+		nodeByID[node.ID] = node
+	}
+
+	// buildProxyConfig 解析节点的 ClashConfig 并注入链式/中转代理的 dialer-proxy
+	buildProxyConfig := func(node storage.Node) (map[string]any, bool) {
+		// ClashConfig 是 JSON 格式的字符串，需要解析
+		var proxyConfig map[string]any
+		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
+			logger.Info("[模板生成] 解析节点配置失败，跳过", "node", node.NodeName, "error", err)
+			return nil, false
+		}
+		// 确保节点名称正确（使用数据库中的名称）
+		proxyConfig["name"] = node.NodeName
+		// 链式代理：根据 chain_proxy_node_id 注入 dialer-proxy
+		if node.ChainProxyNodeID != nil {
+			if targetName, ok := nodeIDToName[*node.ChainProxyNodeID]; ok {
+				proxyConfig["dialer-proxy"] = targetName
+			}
+		}
+		// 中转组：注入 dialer-proxy 指向中转代理组
+		if len(node.RelayGroupNodeIDs) > 0 && node.RelayGroupName != "" {
+			proxyConfig["dialer-proxy"] = node.RelayGroupName
+		}
+		return proxyConfig, true
+	}
+
+	// 将节点转换为 proxies 格式（[]map[string]any）
+	// inRootProxies 记录已写入根 proxies 的节点名，用于中转组底层节点去重补全
+	var proxies []map[string]any
+	inRootProxies := make(map[string]bool)
+	for _, node := range nodes {
+		if !node.Enabled {
+			continue // 跳过禁用的节点
+		}
+		// 标签过滤：只使用选中标签的节点
+		if hasTagFilter && !node.HasAnyTag(selectedTagsMap) {
+			continue
+		}
+		proxyConfig, ok := buildProxyConfig(node)
+		if !ok {
+			continue
+		}
+		proxies = append(proxies, proxyConfig)
+		inRootProxies[node.NodeName] = true
+	}
+
+	// 中转组：按组名去重，同名组只生成一个 proxy-group
+	// extraProxies 收集中转组引用、但未被标签过滤纳入主 proxies 的底层节点，
+	// 仅补入根 proxies 字段（不参与模板的普通/地区代理组展开）
+	relayGroupMap := make(map[string]map[string]any)
+	var extraProxies []map[string]any
+	for _, node := range nodes {
+		if !node.Enabled || len(node.RelayGroupNodeIDs) == 0 || node.RelayGroupName == "" {
+			continue
+		}
+		if hasTagFilter && !node.HasAnyTag(selectedTagsMap) {
+			continue
+		}
+		if _, exists := relayGroupMap[node.RelayGroupName]; exists {
+			continue
+		}
+		var groupProxies []string
+		for _, rid := range node.RelayGroupNodeIDs {
+			member, ok := nodeByID[rid]
+			if !ok || !member.Enabled {
+				// 底层节点已删除或被禁用：从中转组剔除，避免悬空引用
+				logger.Info("[模板生成] 中转组底层节点不可用，已剔除", "group", node.RelayGroupName, "node_id", rid)
+				continue
+			}
+			groupProxies = append(groupProxies, member.NodeName)
+			// 底层节点若未进入主 proxies（被标签过滤），补入根 proxies
+			if !inRootProxies[member.NodeName] {
+				if pc, ok := buildProxyConfig(member); ok {
+					extraProxies = append(extraProxies, pc)
+					inRootProxies[member.NodeName] = true
+				}
+			}
+		}
+		if len(groupProxies) > 0 {
+			relayGroupMap[node.RelayGroupName] = map[string]any{
+				"name":      node.RelayGroupName,
+				"type":      "url-test",
+				"proxies":   groupProxies,
+				"url":       "http://www.gstatic.com/generate_204",
+				"interval":  300,
+				"tolerance": 50,
+			}
+		}
+	}
+	var relayGroups []map[string]any
+	for _, rg := range relayGroupMap {
+		relayGroups = append(relayGroups, rg)
+	}
+
+	logger.Info("[模板生成] 从节点表获取代理节点", "total", len(nodes), "enabled", len(proxies), "tag_filter", hasTagFilter, "relay_groups", len(relayGroups))
+
+	// 3. 从代理集合表获取代理集合配置（用于 proxy-providers）
+	providerConfigs, err := h.repo.ListProxyProviderConfigs(ctx, nodeOwner)
+	if err != nil {
+		logger.Info("[模板生成] 获取代理集合配置失败", "error", err)
+		// 不是致命错误，继续处理
+	}
+
+	// 构建 providers map：provider name -> proxy names
+	providers := make(map[string][]string)
+	providerTagSet := make(map[string]bool)
+	for _, config := range providerConfigs {
+		providerTagSet[config.Name] = true
+	}
+	if len(providerTagSet) > 0 {
+		for _, node := range nodes {
+			if !node.Enabled {
+				continue
+			}
+			for _, t := range node.Tags {
+				if providerTagSet[t] {
+					providers[t] = append(providers[t], node.NodeName)
+				}
+			}
+		}
+	}
+	logger.Info("[模板生成] 从代理集合表获取代理集合", "count", len(providerConfigs), "with_nodes", len(providers))
+	if isLoonTemplateFile(subscribeFile.TemplateFilename) {
+		rootProxies := make([]map[string]any, 0, len(proxies)+len(extraProxies))
+		rootProxies = append(rootProxies, proxies...)
+		rootProxies = append(rootProxies, extraProxies...)
+		result, err := injectProxiesIntoLoonTemplate(string(templateContent), rootProxies)
+		if err != nil {
+			return nil, fmt.Errorf("生成 Loon 配置失败: %w", err)
+		}
+		return []byte(result), nil
+	}
+	if isSurgeTemplateFile(subscribeFile.TemplateFilename) {
+		rootProxies := make([]map[string]any, 0, len(proxies)+len(extraProxies))
+		rootProxies = append(rootProxies, proxies...)
+		rootProxies = append(rootProxies, extraProxies...)
+		result, err := injectProxiesIntoSurgeTemplate(string(templateContent), rootProxies)
+		if err != nil {
+			return nil, fmt.Errorf("生成 Surge 配置失败: %w", err)
+		}
+		return []byte(result), nil
+	}
+
+	// 4. 使用 TemplateV3Processor 处理模板
+	processor := substore.NewTemplateV3Processor(nil, providers)
+	result, err := processor.ProcessTemplate(string(templateContent), proxies)
+	if err != nil {
+		return nil, fmt.Errorf("处理模板失败: %w", err)
+	}
+
+	// 5. 注入代理节点到proxies字段（与预览保持一致）
+	// 根 proxies 字段额外包含中转组引用的底层节点，确保中转代理组引用不悬空
+	rootProxies := make([]map[string]any, 0, len(proxies)+len(extraProxies))
+	rootProxies = append(rootProxies, proxies...)
+	rootProxies = append(rootProxies, extraProxies...)
+	result, err = injectProxiesIntoTemplate(result, rootProxies)
+	if err != nil {
+		return nil, fmt.Errorf("注入代理节点失败: %w", err)
+	}
+
+	// 6. 注入中转代理组到 proxy-groups
+	if len(relayGroups) > 0 {
+		result, err = injectRelayGroupsIntoTemplate(result, relayGroups)
+		if err != nil {
+			logger.Info("[模板生成] 注入中转代理组失败", "error", err)
+		}
+	}
+
+	logger.Info("[模板生成] 模板处理完成", "subscribe", subscribeFile.Name, "template", subscribeFile.TemplateFilename, "result_bytes", len(result))
+
+	return []byte(result), nil
+}
+
+// generateFromSelectedTags 按订阅配置的 selected_tags 从节点表实时生成精简 Clash 配置。
+// 用于聚合订阅：源外部订阅节点增删/更新后，获取订阅时自动反映最新节点集合。
+func (h *SubscriptionHandler) generateFromSelectedTags(ctx context.Context, username string, subscribeFile storage.SubscribeFile) ([]byte, error) {
+	if len(subscribeFile.SelectedTags) == 0 {
+		return nil, errors.New("订阅未配置标签过滤")
+	}
+
+	nodeOwner := username
+	if user, err := h.repo.GetUser(ctx, username); err == nil && user.Role != storage.RoleAdmin {
+		if adminName, err := h.repo.GetAdminUsername(ctx); err == nil {
+			nodeOwner = adminName
+		}
+	}
+	nodes, err := h.repo.ListNodes(ctx, nodeOwner)
+	if err != nil {
+		return nil, fmt.Errorf("获取节点列表失败: %w", err)
+	}
+
+	if settings, err := h.repo.GetUserSettings(ctx, username); err == nil && len(settings.NodeOrder) > 0 {
+		sortNodesByNodeOrder(nodes, settings.NodeOrder)
+	}
+
+	selectedTagsMap := make(map[string]bool, len(subscribeFile.SelectedTags))
+	for _, tag := range subscribeFile.SelectedTags {
+		selectedTagsMap[tag] = true
 	}
 
 	nodeIDToName := make(map[int64]string, len(nodes))
-	nameToChainTarget := make(map[string]string)
-	hasChainProxy := false
 	for _, node := range nodes {
 		nodeIDToName[node.ID] = node.NodeName
 	}
+
+	var proxies []map[string]any
+	var proxyNames []string
 	for _, node := range nodes {
-		if node.ChainProxyNodeID != nil {
-			if targetName, ok := nodeIDToName[*node.ChainProxyNodeID]; ok {
-				nameToChainTarget[node.NodeName] = targetName
-				hasChainProxy = true
-			}
-		}
-	}
-	if !hasChainProxy {
-		return data
-	}
-
-	var yamlNode yaml.Node
-	if err := yaml.Unmarshal(data, &yamlNode); err != nil {
-		return data
-	}
-	if len(yamlNode.Content) == 0 || yamlNode.Content[0].Kind != yaml.MappingNode {
-		return data
-	}
-
-	rootMap := yamlNode.Content[0]
-	modified := false
-	for i := 0; i < len(rootMap.Content); i += 2 {
-		if rootMap.Content[i].Value != "proxies" {
+		if !node.Enabled {
 			continue
 		}
-		proxiesNode := rootMap.Content[i+1]
-		if proxiesNode.Kind != yaml.SequenceNode {
-			break
+		if !node.HasAnyTag(selectedTagsMap) {
+			continue
 		}
-		for _, proxyNode := range proxiesNode.Content {
-			if proxyNode.Kind != yaml.MappingNode {
-				continue
-			}
-			var proxyName string
-			for j := 0; j < len(proxyNode.Content); j += 2 {
-				if proxyNode.Content[j].Value == "name" {
-					proxyName = proxyNode.Content[j+1].Value
-					break
-				}
-			}
-			if targetName, ok := nameToChainTarget[proxyName]; ok {
-				proxyNode.Content = append(proxyNode.Content,
-					&yaml.Node{Kind: yaml.ScalarNode, Value: "dialer-proxy"},
-					&yaml.Node{Kind: yaml.ScalarNode, Value: targetName},
-				)
-				modified = true
+		var proxyConfig map[string]any
+		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
+			logger.Info("[标签动态生成] 解析节点配置失败，跳过", "node", node.NodeName, "error", err)
+			continue
+		}
+		proxyConfig["name"] = node.NodeName
+		if node.ChainProxyNodeID != nil {
+			if targetName, ok := nodeIDToName[*node.ChainProxyNodeID]; ok {
+				proxyConfig["dialer-proxy"] = targetName
 			}
 		}
-		break
+		if len(node.RelayGroupNodeIDs) > 0 && node.RelayGroupName != "" {
+			proxyConfig["dialer-proxy"] = node.RelayGroupName
+		}
+		proxies = append(proxies, proxyConfig)
+		proxyNames = append(proxyNames, node.NodeName)
 	}
 
-	if !modified {
-		return data
+	groupProxies := append([]string{}, proxyNames...)
+	groupProxies = append(groupProxies, "DIRECT")
+	cfg := map[string]any{
+		"mixed-port":          7890,
+		"allow-lan":           true,
+		"mode":                "rule",
+		"log-level":           "info",
+		"external-controller": "127.0.0.1:9090",
+		"proxies":             proxies,
+		"proxy-groups": []map[string]any{
+			{
+				"name":    "PROXY",
+				"type":    "select",
+				"proxies": groupProxies,
+			},
+		},
+		"rules": []string{
+			"MATCH,PROXY",
+		},
 	}
 
-	out, err := MarshalYAMLWithIndent(&yamlNode)
+	out, err := yaml.Marshal(cfg)
 	if err != nil {
-		return data
+		return nil, fmt.Errorf("序列化配置失败: %w", err)
 	}
-	fixed := RemoveUnicodeEscapeQuotes(string(out))
-	logger.Info("[Subscription] 链式代理注入完成", "user", username, "injected", len(nameToChainTarget))
-	return []byte(fixed)
+	logger.Info("[标签动态生成] 完成", "subscribe", subscribeFile.Name, "tags", subscribeFile.SelectedTags, "proxy_count", len(proxies))
+	return out, nil
 }
 
-// ─── 订阅 YAML → JSON 序列化(从妙妙屋 subscription.go L2506-2679 移植,无 mmw 特化) ───
-//
-// 用 yaml.Node 解析后手工写出 JSON,这样可以:
-//   1. 保留 proxies / proxy-groups 顶层数组的多行格式(可读性)
-//   2. 元素内部的 proxy / group 字段按 name → type → server → port 排序(对照 mihomo 客户端常见展示顺序)
-//   3. 数字 / bool / null 等 YAML scalar tag 正确转 JSON 字面量(避免 "true" 这种带引号字符串)
-//
-// 输入是 SubscriptionHandler 早些处理过的 YAML 字节流,输出是 application/json 等价物。
-// 仅用于 Clash 订阅(其它 client 类型如 surge / sing-box 不调用此函数)。
+// createSubInfoNodes creates subscription info nodes (expire time and remaining traffic)
+func createSubInfoNodes(config storage.SystemConfig, expireAt *time.Time, remainingTraffic int64) []*yaml.Node {
+	var nodes []*yaml.Node
 
+	// Expire time node
+	expireName := config.SubInfoExpirePrefix + " "
+	if expireAt != nil {
+		expireName += expireAt.Format("2006-01-02")
+	} else {
+		expireName += "永久"
+	}
+
+	// Remaining traffic node
+	trafficName := config.SubInfoTrafficPrefix + " " + formatTrafficSize(remainingTraffic)
+
+	// Create dummy SS nodes
+	createDummyNode := func(name string) *yaml.Node {
+		return &yaml.Node{
+			Kind: yaml.MappingNode,
+			Content: []*yaml.Node{
+				{Kind: yaml.ScalarNode, Value: "name"},
+				{Kind: yaml.ScalarNode, Value: name},
+				{Kind: yaml.ScalarNode, Value: "type"},
+				{Kind: yaml.ScalarNode, Value: "ss"},
+				{Kind: yaml.ScalarNode, Value: "server"},
+				{Kind: yaml.ScalarNode, Value: "sub.info.node"},
+				{Kind: yaml.ScalarNode, Value: "port"},
+				{Kind: yaml.ScalarNode, Value: "443", Tag: "!!int"},
+				{Kind: yaml.ScalarNode, Value: "password"},
+				{Kind: yaml.ScalarNode, Value: "SubInfoNode"},
+				{Kind: yaml.ScalarNode, Value: "cipher"},
+				{Kind: yaml.ScalarNode, Value: "aes-128-gcm"},
+			},
+		}
+	}
+
+	nodes = append(nodes, createDummyNode(expireName), createDummyNode(trafficName))
+	return nodes
+}
+
+// isV2RayClientType 判断是不是 v2ray 系(base64 / URI 节点列表)客户端。这类输出没有 clash
+// 的 proxies 结构可供事后注入,信息节点得在转换成 base64 之前就塞进 clash proxies。
+func isV2RayClientType(clientType string) bool {
+	return clientType == "v2ray" || clientType == "uri"
+}
+
+// prependSubInfoNodesToClash 把信息节点插到 clash YAML 的 proxies 开头,供 v2ray 分支在转换前调用。
+// 解析失败就原样返回并带出 error —— 信息节点是锦上添花,不该让订阅整个坏掉。
+func prependSubInfoNodesToClash(data []byte, config storage.SystemConfig, expireAt *time.Time, remainingTraffic int64) ([]byte, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return data, err
+	}
+	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
+		return data, fmt.Errorf("unexpected clash yaml structure")
+	}
+	rootMap := root.Content[0]
+	for i := 0; i+1 < len(rootMap.Content); i += 2 {
+		if rootMap.Content[i].Value == "proxies" {
+			if proxiesNode := rootMap.Content[i+1]; proxiesNode.Kind == yaml.SequenceNode {
+				infoNodes := createSubInfoNodes(config, expireAt, remainingTraffic)
+				proxiesNode.Content = append(infoNodes, proxiesNode.Content...)
+			}
+			break
+		}
+	}
+	out, err := yaml.Marshal(&root)
+	if err != nil {
+		return data, err
+	}
+	return out, nil
+}
+
+// formatTrafficSize formats bytes to human readable format (GB/MB/KB)
+func formatTrafficSize(bytes int64) string {
+	if bytes <= 0 {
+		return "0B"
+	}
+	gb := float64(bytes) / (1024 * 1024 * 1024)
+	if gb >= 1 {
+		return fmt.Sprintf("%.2fGB", gb)
+	}
+	mb := float64(bytes) / (1024 * 1024)
+	if mb >= 1 {
+		return fmt.Sprintf("%.2fMB", mb)
+	}
+	kb := float64(bytes) / 1024
+	return fmt.Sprintf("%.2fKB", kb)
+}
+
+// marshalSubscriptionJSON 将 YAML 订阅数据转换为自定义 JSON 格式：
+// 顶层属性展开（每行一个），嵌套值紧凑（单行），
+// proxies 和 proxy-groups 内的元素属性按 name, type, server, port 优先排序。
 func marshalSubscriptionJSON(yamlData []byte) ([]byte, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(yamlData, &doc); err != nil {
@@ -2492,6 +2823,17 @@ func marshalSubscriptionJSON(yamlData []byte) ([]byte, error) {
 
 	buf.WriteString("}\n")
 	return buf.Bytes(), nil
+}
+
+func makeIDSet(ids []int64) map[int64]bool {
+	if len(ids) == 0 {
+		return nil
+	}
+	m := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		m[id] = true
+	}
+	return m
 }
 
 var jsonProxyKeyPriority = []string{"name", "type", "server", "port"}
@@ -2617,4 +2959,101 @@ func jsonWriteScalar(buf *bytes.Buffer, node *yaml.Node) {
 func jsonEncodeString(buf *bytes.Buffer, s string) {
 	b, _ := json.Marshal(s)
 	buf.Write(b)
+}
+
+// deduplicateProxies 对 Clash YAML 做兜底去重：
+// 1. proxies 列表中同名节点只保留第一个
+// 2. proxy-groups 中每个 group 的 proxies 列表去重
+func deduplicateProxies(data []byte, username string) []byte {
+	var config map[string]interface{}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return data
+	}
+
+	changed := false
+
+	// 去重 proxies
+	if proxiesRaw, ok := config["proxies"]; ok {
+		if proxies, ok := proxiesRaw.([]interface{}); ok {
+			seen := make(map[string]bool)
+			deduped := make([]interface{}, 0, len(proxies))
+			for _, p := range proxies {
+				pm, ok := p.(map[string]interface{})
+				if !ok {
+					deduped = append(deduped, p)
+					continue
+				}
+				name, _ := pm["name"].(string)
+				if name == "" {
+					deduped = append(deduped, p)
+					continue
+				}
+				if seen[name] {
+					logger.Warn("[DEDUP] 移除重复节点",
+						"user", username,
+						"node", name,
+					)
+					changed = true
+					continue
+				}
+				seen[name] = true
+				deduped = append(deduped, p)
+			}
+			if changed {
+				config["proxies"] = deduped
+			}
+		}
+	}
+
+	// 去重 proxy-groups 中每个 group 的 proxies
+	if groupsRaw, ok := config["proxy-groups"]; ok {
+		if groups, ok := groupsRaw.([]interface{}); ok {
+			for _, g := range groups {
+				gm, ok := g.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				groupName, _ := gm["name"].(string)
+				proxiesRaw, ok := gm["proxies"]
+				if !ok {
+					continue
+				}
+				proxies, ok := proxiesRaw.([]interface{})
+				if !ok {
+					continue
+				}
+				seen := make(map[string]bool)
+				deduped := make([]interface{}, 0, len(proxies))
+				for _, p := range proxies {
+					name, _ := p.(string)
+					if name == "" {
+						deduped = append(deduped, p)
+						continue
+					}
+					if seen[name] {
+						logger.Warn("[DEDUP] 移除 proxy-group 中重复引用",
+							"user", username,
+							"group", groupName,
+							"node", name,
+						)
+						changed = true
+						continue
+					}
+					seen[name] = true
+					deduped = append(deduped, p)
+				}
+				gm["proxies"] = deduped
+			}
+		}
+	}
+
+	if !changed {
+		return data
+	}
+
+	out, err := yaml.Marshal(config)
+	if err != nil {
+		return data
+	}
+	return out
 }

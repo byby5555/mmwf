@@ -14,8 +14,6 @@ func GetSubscriptionRateLimiter() *SubscriptionRateLimiter {
 	return globalSubscriptionRateLimiter
 }
 
-// SubscriptionRateLimiter 对"获取订阅"类请求(短链接 /x/、临时订阅 /t/、/api/clash/subscribe 等)
-// 做每 IP 频率限制,防止枚举/抓取滥用。固定窗口计数。
 type subRateRecord struct {
 	count       int
 	windowStart time.Time
@@ -24,15 +22,12 @@ type subRateRecord struct {
 type SubscriptionRateLimiter struct {
 	mu      sync.Mutex
 	ips     map[string]*subRateRecord
-	enabled bool
-	limit   int
-	window  time.Duration
-	// skipLocalIP 命中本地/私有 IP 时直接 Allow,
-	// 防反代未传 XFF 时全员共享一个内网 IP 一起被 429。默认 true。
+	enabled     bool
+	limit       int
+	window      time.Duration
 	skipLocalIP bool
 }
 
-// NewSubscriptionRateLimiter limit=窗口内最大请求数,window=窗口时长。
 func NewSubscriptionRateLimiter(limit int, window time.Duration) *SubscriptionRateLimiter {
 	if limit <= 0 {
 		limit = 60
@@ -51,33 +46,12 @@ func NewSubscriptionRateLimiter(limit int, window time.Duration) *SubscriptionRa
 	return l
 }
 
-// NewSubscriptionRateLimiterWithConfig 用 system_settings 自定义阈值构造。
-func NewSubscriptionRateLimiterWithConfig(enabled bool, limit, windowMinutes int) *SubscriptionRateLimiter {
-	if limit <= 0 {
-		limit = 60
-	}
-	if windowMinutes <= 0 {
-		windowMinutes = 1
-	}
-	l := &SubscriptionRateLimiter{
-		ips:         make(map[string]*subRateRecord),
-		enabled:     enabled,
-		limit:       limit,
-		window:      time.Duration(windowMinutes) * time.Minute,
-		skipLocalIP: true,
-	}
-	globalSubscriptionRateLimiter = l
-	return l
-}
-
-// SetSkipLocalIP 切换"是否跳过本地/私有 IP 的频率限制"。
 func (l *SubscriptionRateLimiter) SetSkipLocalIP(skip bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.skipLocalIP = skip
 }
 
-// UpdateConfig 热更新参数 — security_settings handler PUT 后调用。
 func (l *SubscriptionRateLimiter) UpdateConfig(enabled bool, limit, windowMinutes int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

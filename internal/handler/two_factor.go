@@ -10,6 +10,7 @@ import (
 
 	"miaomiaowux/internal/auth"
 	"miaomiaowux/internal/logger"
+	"miaomiaowux/internal/notify"
 	"miaomiaowux/internal/storage"
 )
 
@@ -42,6 +43,11 @@ func NewTwoFactorLoginHandler(tokens *auth.TokenStore, repo *storage.TrafficRepo
 		}
 
 		if !auth.ValidateTOTPCode(user.TOTPSecret, strings.TrimSpace(payload.Code)) {
+			// [安全] 限制爆破:达到上限即作废该 2FA 令牌,迫使重新走(有限流的)密码登录。
+			if tfStore.RecordFailure(payload.TwoFactorToken) {
+				writeError(w, http.StatusUnauthorized, errors.New("尝试次数过多,请重新登录"))
+				return
+			}
 			writeError(w, http.StatusUnauthorized, errors.New("invalid 2FA code"))
 			return
 		}
@@ -87,6 +93,11 @@ func NewRecoveryLoginHandler(tokens *auth.TokenStore, repo *storage.TrafficRepos
 
 		valid, _ := auth.ValidateRecoveryCode(payload.RecoveryCode, hashedCodes)
 		if !valid {
+			// [安全] 同 2FA:限制爆破,达到上限作废令牌。
+			if tfStore.RecordFailure(payload.TwoFactorToken) {
+				writeError(w, http.StatusUnauthorized, errors.New("尝试次数过多,请重新登录"))
+				return
+			}
 			writeError(w, http.StatusUnauthorized, errors.New("invalid recovery code"))
 			return
 		}
@@ -144,7 +155,7 @@ func NewTwoFactorSetupHandler(manager *auth.Manager, repo *storage.TrafficReposi
 			return
 		}
 
-		key, err := auth.GenerateTOTPKey(username, "妙妙屋X")
+		key, err := auth.GenerateTOTPKey(username, "妙妙屋")
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -277,13 +288,19 @@ func issueLoginSession(w http.ResponseWriter, r *http.Request, tokens *auth.Toke
 	}
 
 	clientIP := GetClientIP(r)
-	logger.Info("[认证] 登录成功",
+	logger.Info("🔐 [LOGIN_OK] 登录成功",
 		"username", user.Username,
 		"client_ip", clientIP,
 		"remember_me", rememberMe,
 		"expires_at", expiry.Format("2006-01-02 15:04:05"))
 
-	SendLoginNotification(r.Context(), user.Username, clientIP)
+	if n := GetNotifier(); n != nil {
+		go n.Send(r.Context(), notify.Event{
+			Type:    notify.EventLogin,
+			Title:   "登录通知",
+			Message: fmt.Sprintf("用户 `%s` 登录成功\nIP: `%s`", user.Username, clientIP),
+		})
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

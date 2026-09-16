@@ -1,19 +1,25 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"miaomiaowux/internal/logger"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"miaomiaowux/internal/auth"
-	"miaomiaowux/internal/logger"
 	"miaomiaowux/internal/storage"
 )
 
@@ -34,16 +40,23 @@ type trafficSummaryMetrics struct {
 	TotalUsedGB      float64 `json:"total_used_gb"`
 	TotalRemainingGB float64 `json:"total_remaining_gb"`
 	UsagePercentage  float64 `json:"usage_percentage"`
-	// UnlimitedUsedGB 仅管理员视角:不限流量服务器(traffic_limit=0)的已用流量合计,
-	// 不计入上面的百分比;前端在"已用流量"旁用图标 hover 展示。
-	UnlimitedUsedGB float64 `json:"unlimited_used_gb"`
 }
 
 type trafficDailyUsage struct {
-	Date string `json:"date"`
-	// 指针 + null:该日期没有任何记录(快照任务没跑成)时为 null,前端画断点。
-	// 用 0 会把"没采到"谎报成"当天真没跑流量",两者在排查时含义完全不同。
-	UsedGB *float64 `json:"used_gb"`
+	Date   string  `json:"date"`
+	UsedGB float64 `json:"used_gb"`
+}
+
+type batchTrafficResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Data    map[string]struct {
+		Monthly struct {
+			Limit     json.Number `json:"limit"`
+			Remaining json.Number `json:"remaining"`
+			Used      json.Number `json:"used"`
+		} `json:"monthly"`
+	} `json:"data"`
 }
 
 func NewTrafficSummaryHandler(repo *storage.TrafficRepository) *TrafficSummaryHandler {
@@ -72,102 +85,44 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 	ctx := r.Context()
 	username := auth.UsernameFromContext(ctx)
 
-	var user storage.User
-	haveUser := false
-	if username != "" && h.repo != nil {
-		if u, err := h.repo.GetUser(ctx, username); err == nil {
-			user = u
-			haveUser = true
-		}
-	}
-	isAdmin := haveUser && user.Role == storage.RoleAdmin
+	var totalLimit, totalRemaining, totalUsed int64
+	var probeErr error
 
-	var totalLimit, totalUsed, unlimitedUsed int64
-	// serverListOK 跟踪 ListRemoteServers 是否成功 — 后面 recordSnapshot 用它兜底,
-	// 防止"DB 临时报错 → 全 0 → ON CONFLICT 覆盖正确历史"事故(实际 2026-05-31 已发生)。
-	serverListOK := false
-
-	if isAdmin {
-		// 管理员:汇总所有服务器(含主控本机,它也是 remote_servers 一行)。
-		// 限流服务器(traffic_limit>0)计入 已用/限额;不限流量服务器(=0)的已用单独汇总,
-		// 前端在"已用流量"旁用图标 hover 展示,不计入百分比(否则分母没有限额会失真)。
-		if servers, err := h.repo.ListRemoteServers(ctx); err == nil {
-			serverListOK = true
-			for _, s := range servers {
-				aggregated, _ := h.repo.GetServerTrafficUsed(ctx, s.ID)
-				used := aggregated + s.TrafficUsedOffset
-				if used < 0 {
-					used = 0 // 与 RecordDailyUsage 保持一致:offset 设过头时兜底。
-					// 两个写入者都写同一行 traffic_records,公式不一致会让"谁最后写"决定值大小,
-					// 相邻两天写入者不同就会凭空造出负 delta。
-				}
-				if s.TrafficLimit > 0 {
-					totalLimit += s.TrafficLimit
-					totalUsed += used
-				} else {
-					unlimitedUsed += used
-				}
-			}
+	totalLimit, totalRemaining, totalUsed, probeErr = h.fetchTotals(ctx, username, nil)
+	if probeErr != nil {
+		// Log the error but continue to try external subscription traffic
+		if errors.Is(probeErr, storage.ErrProbeConfigNotFound) {
+			logger.Info("[Traffic] Probe not configured, will use external subscription traffic only")
 		} else {
-			logger.Warn("[流量] ListRemoteServers 失败,跳过本次快照避免覆盖历史", "error", err)
+			logger.Info("[流量] 获取探针流量失败", "error", probeErr)
 		}
-		// 外部订阅流量:仅当系统级"外部订阅同步"开关开启时并入。
-		if enabled, _ := h.repo.IsSyncTrafficEnabled(ctx); enabled {
-			extLimit, extUsed := h.fetchExternalSubscriptionTraffic(ctx, username)
-			totalLimit += extLimit
-			totalUsed += extUsed
-		}
-	} else if haveUser {
-		// 普通用户:套餐流量。已用按套餐流量倍率(oneway×1 / twoway×2)计费,
-		// 与限额判定口径一致(见 traffic_limit_enforcer:已用×TrafficMultiplier 比限额)。
-		if user.PackageID > 0 {
-			if pkg, perr := h.repo.GetPackage(ctx, user.PackageID); perr == nil {
-				// 有效上限 = 用户级覆写 ?? 套餐流量,与 enforcer 断流口径一致。
-				totalLimit += resolveTrafficLimitBytes(&user, pkg)
-				// 计费流量:倍率已由 collector 在采集时折算进 weighted_*,拿到即最终值,不再乘倍率。
-				if billable, terr := h.repo.GetUserBillableTraffic(ctx, username); terr == nil {
-					totalUsed += billable
-				}
-			}
-		}
-		// 外部订阅(该用户开启 sync_traffic 时)叠加。
-		extLimit, extUsed := h.fetchExternalSubscriptionTraffic(ctx, username)
-		totalLimit += extLimit
-		totalUsed += extUsed
+		// Reset values in case of error
+		totalLimit, totalRemaining, totalUsed = 0, 0, 0
 	}
 
-	totalRemaining := totalLimit - totalUsed
-	if totalRemaining < 0 {
-		totalRemaining = 0
+	// Add external subscription traffic if sync_traffic is enabled
+	if username != "" {
+		externalLimit, externalUsed := h.fetchExternalSubscriptionTraffic(ctx, username)
+		totalLimit += externalLimit
+		totalUsed += externalUsed
+		// Recalculate remaining
+		totalRemaining = totalLimit - totalUsed
 	}
 
-	if isAdmin {
-		// 两道守卫,任一命中都跳过 record — 避免污染 traffic_records:
-		//   1. serverListOK=false:ListRemoteServers 出错,totalLimit/totalUsed 全 0 是假象不是真实状态
-		//   2. totalLimit==0 && totalUsed==0:理论上正常环境不可能(必有 server 配置 traffic_limit),
-		//      出现 = 数据异常,写进去会被 ON CONFLICT(date) DO UPDATE 覆盖正确历史
-		//      → 前端 loadHistory delta = today - 0 ≈ 全部历史累计,首页图表出 1.9TB 这种诡异数字
-		switch {
-		case !serverListOK:
-			logger.Warn("[流量] 跳过快照: ListRemoteServers 失败,无法判断当前流量")
-		case totalLimit == 0 && totalUsed == 0:
-			logger.Warn("[流量] 跳过快照: totalLimit/totalUsed 全 0,可能 DB 临时异常")
-		default:
-			if err := h.recordSnapshot(ctx, totalLimit, totalUsed, totalRemaining); err != nil {
-				logger.Info("[流量] 记录快照失败", "error", err)
-			}
-		}
-	} else if haveUser {
-		if err := h.repo.RecordUserDaily(ctx, username, time.Now(), totalLimit, totalUsed, totalRemaining); err != nil {
-			logger.Info("[流量] 记录用户快照失败", "error", err)
-		}
+	// If no traffic data from either source, return appropriate response
+	if totalLimit == 0 && totalUsed == 0 && probeErr != nil && !errors.Is(probeErr, storage.ErrProbeConfigNotFound) {
+		// Only return error if probe failed (not just not configured) and no external traffic
+		writeError(w, http.StatusBadGateway, probeErr)
+		return
 	}
 
-	var history []trafficDailyUsage
-	if isAdmin {
-		history, _ = h.loadHistory(ctx, 30)
-	} else if username != "" {
-		history, _ = h.loadUserHistory(ctx, username, 30)
+	if err := h.recordSnapshot(ctx, totalLimit, totalUsed, totalRemaining); err != nil {
+		logger.Info("[流量] 记录快照失败", "error", err)
+	}
+
+	history, err := h.loadHistory(ctx, 30)
+	if err != nil {
+		logger.Info("[流量] 加载历史记录失败", "error", err)
 	}
 
 	metrics := trafficSummaryMetrics{
@@ -175,7 +130,6 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		TotalUsedGB:      roundUpTwoDecimals(bytesToGigabytes(totalUsed)),
 		TotalRemainingGB: roundUpTwoDecimals(bytesToGigabytes(totalRemaining)),
 		UsagePercentage:  roundUpTwoDecimals(usagePercentage(totalUsed, totalLimit)),
-		UnlimitedUsedGB:  roundUpTwoDecimals(bytesToGigabytes(unlimitedUsed)),
 	}
 
 	response := trafficSummaryResponse{
@@ -188,66 +142,64 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-// 获取最新的流量摘要并保留快照。
+// RecordDailyUsage fetches the latest traffic summary and persists the snapshot.
 func (h *TrafficSummaryHandler) RecordDailyUsage(ctx context.Context) error {
 	var totalLimit, totalRemaining, totalUsed int64
+	var probeErr error
 
-	// **聚合所有 remote servers 流量**(老 bug:这块完全没算,只算 external 订阅 → 写 0 进 db
-	// → 每日趋势图除了少数几天有 external 数据外全是 0,显示成大尖峰加 flat line)。
-	// 算法跟 BuildSummary admin 分支一致:aggregated + offset,限流的计入,不限流的丢弃。
-	// ListRemoteServers 失败时 skip 整个写入,避免 ON CONFLICT 覆盖正确历史。
-	serverListOK := false
-	if h.repo != nil {
-		if servers, err := h.repo.ListRemoteServers(ctx); err == nil {
-			serverListOK = true
-			for _, s := range servers {
-				aggregated, _ := h.repo.GetServerTrafficUsed(ctx, s.ID)
-				used := aggregated + s.TrafficUsedOffset
-				if used < 0 {
-					used = 0 // offset 设过头时兜底,防止负值拉低总数
-				}
-				if s.TrafficLimit > 0 {
-					totalLimit += s.TrafficLimit
-					totalUsed += used
-				}
-				// 不限流服务器不计入 totalLimit / totalUsed(同 BuildSummary 行为)
-			}
+	totalLimit, totalRemaining, totalUsed, probeErr = h.fetchTotals(ctx, "", nil)
+	if probeErr != nil {
+		if errors.Is(probeErr, storage.ErrProbeConfigNotFound) {
+			logger.Info("[流量记录] 探针未配置，仅使用外部订阅流量")
 		} else {
-			logger.Warn("[流量记录] ListRemoteServers 失败,跳过本次快照避免覆盖历史", "error", err)
+			logger.Warn("[流量记录] 获取探针流量失败", "error", probeErr)
 		}
+		totalLimit, totalRemaining, totalUsed = 0, 0, 0
+	} else {
+		// Log fetched probe data
+		limitGB := roundUpTwoDecimals(bytesToGigabytes(totalLimit))
+		usedGB := roundUpTwoDecimals(bytesToGigabytes(totalUsed))
+		remainingGB := roundUpTwoDecimals(bytesToGigabytes(totalRemaining))
+		usagePercent := roundUpTwoDecimals(usagePercentage(totalUsed, totalLimit))
+
+		logger.Info("[流量记录] 从探针获取流量",
+			"limit_gb", limitGB,
+			"used_gb", usedGB,
+			"remaining_gb", remainingGB,
+			"usage_percent", usagePercent)
 	}
 
-	// 同步并添加外部订阅流量(系统级 sync_traffic 开关开时才有数据)
+	// Sync and add external subscription traffic
 	externalLimit, externalUsed := h.syncAndFetchExternalSubscriptionTraffic(ctx)
 	if externalLimit > 0 || externalUsed > 0 {
 		totalLimit += externalLimit
 		totalUsed += externalUsed
-		logger.Info("[流量记录] 外部订阅流量",
+		totalRemaining = totalLimit - totalUsed
+		if totalRemaining < 0 {
+			totalRemaining = 0
+		}
+
+		logger.Info("[流量记录] 添加外部订阅流量",
 			"limit_gb", bytesToGigabytes(externalLimit),
 			"used_gb", bytesToGigabytes(externalUsed))
 	}
 
-	totalRemaining = totalLimit - totalUsed
-	if totalRemaining < 0 {
-		totalRemaining = 0
+	// If no traffic data from either source, return error only if probe failed (not just not configured)
+	if totalLimit == 0 && totalUsed == 0 && probeErr != nil && !errors.Is(probeErr, storage.ErrProbeConfigNotFound) {
+		return probeErr
 	}
 
-	// 守卫:ListRemoteServers 失败 / 没数据时不写入,避免 ON CONFLICT(date) 把已有正确历史覆盖成 0。
-	// 跟 BuildSummary admin 守卫一致。
-	switch {
-	case !serverListOK:
-		logger.Warn("[流量记录] 跳过快照: ListRemoteServers 失败,无法判断当前流量")
-		return nil
-	case totalLimit == 0 && totalUsed == 0:
-		logger.Warn("[流量记录] 跳过快照: totalLimit/totalUsed 全 0,可能 DB 临时异常")
-		return nil
-	}
+	// Log total traffic
+	limitGB := roundUpTwoDecimals(bytesToGigabytes(totalLimit))
+	usedGB := roundUpTwoDecimals(bytesToGigabytes(totalUsed))
+	remainingGB := roundUpTwoDecimals(bytesToGigabytes(totalRemaining))
+	usagePercent := roundUpTwoDecimals(usagePercentage(totalUsed, totalLimit))
 
 	logger.Info("[流量记录] 总计流量",
-		"limit_gb", roundUpTwoDecimals(bytesToGigabytes(totalLimit)),
-		"used_gb", roundUpTwoDecimals(bytesToGigabytes(totalUsed)),
-		"remaining_gb", roundUpTwoDecimals(bytesToGigabytes(totalRemaining)),
-		"usage_percent", roundUpTwoDecimals(usagePercentage(totalUsed, totalLimit)))
+		"limit_gb", limitGB,
+		"used_gb", usedGB,
+		"remaining_gb", remainingGB,
+		"usage_percent", usagePercent)
 
 	if err := h.recordSnapshot(ctx, totalLimit, totalUsed, totalRemaining); err != nil {
 		logger.Error("[流量记录] 保存快照到数据库失败", "error", err)
@@ -258,14 +210,14 @@ func (h *TrafficSummaryHandler) RecordDailyUsage(ctx context.Context) error {
 	return nil
 }
 
-// 启用sync_traffic（系统级设置）时，syncAndFetchExternalSubscriptionTraffic 会同步来自外部订阅的流量信息
-// 返回未过期订阅的totalLimit 和totalUsed
+// syncAndFetchExternalSubscriptionTraffic syncs traffic info from external subscriptions when sync_traffic is enabled (system-level setting)
+// Returns totalLimit and totalUsed from non-expired subscriptions
 func (h *TrafficSummaryHandler) syncAndFetchExternalSubscriptionTraffic(ctx context.Context) (int64, int64) {
 	if h.repo == nil {
 		return 0, 0
 	}
 
-	// 检查sync_traffic是否启用（系统级设置）
+	// Check if sync_traffic is enabled (system-level setting)
 	enabled, err := h.repo.IsSyncTrafficEnabled(ctx)
 	if err != nil {
 		logger.Warn("[流量记录] 检查sync_traffic设置失败", "error", err)
@@ -277,7 +229,7 @@ func (h *TrafficSummaryHandler) syncAndFetchExternalSubscriptionTraffic(ctx cont
 		return 0, 0
 	}
 
-	// 获取所有用户的所有外部订阅
+	// Get all external subscriptions from all users
 	subs, err := h.repo.ListAllExternalSubscriptions(ctx)
 	if err != nil {
 		logger.Warn("[流量记录] 获取外部订阅失败", "error", err)
@@ -295,39 +247,54 @@ func (h *TrafficSummaryHandler) syncAndFetchExternalSubscriptionTraffic(ctx cont
 	now := time.Now()
 
 	for _, sub := range subs {
-		// 从订阅 URL 获取并更新流量信息
+		// Fetch and update traffic info from subscription URL
 		updatedSub, err := h.fetchExternalSubscriptionTrafficInfo(ctx, sub)
 		if err != nil {
 			logger.Info("[流量记录] 获取订阅流量失败", "name", sub.Name, "error", err)
-			// 如果获取失败，则使用现有数据
+			// Use existing data if fetch fails
 			updatedSub = sub
 		} else {
-			// 更新数据库中的订阅
+			// Update subscription in database
 			if updateErr := h.repo.UpdateExternalSubscription(ctx, updatedSub); updateErr != nil {
 				logger.Info("[流量记录] 更新订阅失败", "name", sub.Name, "error", updateErr)
 			}
 		}
 
-		// 跳过过期的订阅
+		// Skip expired subscriptions
 		if updatedSub.Expire != nil && updatedSub.Expire.Before(now) {
 			logger.Info("[流量记录] 跳过已过期订阅", "name", updatedSub.Name, "expired_at", updatedSub.Expire.Format("2006-01-02 15:04:05"))
 			continue
 		}
 
-		// 添加来自此订阅的流量
+		// Skip subscriptions with traffic mode "none"
+		if strings.ToLower(strings.TrimSpace(updatedSub.TrafficMode)) == "none" {
+			logger.Info("[流量记录] 跳过不统计订阅", "name", updatedSub.Name)
+			continue
+		}
+
+		// Add traffic from this subscription based on TrafficMode
+		var used int64
+		switch strings.ToLower(strings.TrimSpace(updatedSub.TrafficMode)) {
+		case "download":
+			used = updatedSub.Download
+		case "upload":
+			used = updatedSub.Upload
+		default: // "both" or empty
+			used = updatedSub.Upload + updatedSub.Download
+		}
 		totalLimit += updatedSub.Total
-		totalUsed += updatedSub.Upload + updatedSub.Download
+		totalUsed += used
 
 		if updatedSub.Expire == nil {
 			logger.Info("[流量记录] 添加长期订阅流量",
 				"name", updatedSub.Name,
 				"limit_gb", bytesToGigabytes(updatedSub.Total),
-				"used_gb", bytesToGigabytes(updatedSub.Upload+updatedSub.Download))
+				"used_gb", bytesToGigabytes(used))
 		} else {
 			logger.Info("[流量记录] 添加订阅流量",
 				"name", updatedSub.Name,
 				"limit_gb", bytesToGigabytes(updatedSub.Total),
-				"used_gb", bytesToGigabytes(updatedSub.Upload+updatedSub.Download),
+				"used_gb", bytesToGigabytes(used),
 				"expires", updatedSub.Expire.Format("2006-01-02 15:04:05"))
 		}
 	}
@@ -339,7 +306,7 @@ func (h *TrafficSummaryHandler) syncAndFetchExternalSubscriptionTraffic(ctx cont
 	return totalLimit, totalUsed
 }
 
-// 从外部订阅 URL 获取流量信息
+// fetchExternalSubscriptionTrafficInfo fetches traffic info from external subscription URL
 func (h *TrafficSummaryHandler) fetchExternalSubscriptionTrafficInfo(ctx context.Context, sub storage.ExternalSubscription) (storage.ExternalSubscription, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sub.URL, nil)
 	if err != nil {
@@ -362,13 +329,13 @@ func (h *TrafficSummaryHandler) fetchExternalSubscriptionTrafficInfo(ctx context
 		return sub, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	// 解析订阅用户信息标头
+	// Parse subscription-userinfo header
 	userInfo := resp.Header.Get("subscription-userinfo")
 	if userInfo == "" {
-		return sub, nil // 没有可用的交通信息
+		return sub, nil // No traffic info available
 	}
 
-	// 解析交通信息
+	// Parse traffic info
 	upload, download, total, expire := ParseTrafficInfoHeader(userInfo)
 
 	sub.Upload = upload
@@ -383,6 +350,756 @@ func (h *TrafficSummaryHandler) fetchExternalSubscriptionTrafficInfo(ctx context
 		"total_gb", float64(total)/(1024*1024*1024))
 
 	return sub, nil
+}
+
+func (h *TrafficSummaryHandler) fetchTotals(ctx context.Context, username string, allowedProbeServers map[string]struct{}) (int64, int64, int64, error) {
+	if h.repo == nil {
+		return 0, 0, 0, errors.New("traffic repository not configured")
+	}
+
+	// Determine which probe servers to include
+	var probeFilter map[string]struct{}
+
+	// If allowedProbeServers is explicitly provided, use it as the filter
+	if allowedProbeServers != nil {
+		probeFilter = make(map[string]struct{}, len(allowedProbeServers))
+		for name := range allowedProbeServers {
+			trimmed := strings.TrimSpace(name)
+			if trimmed != "" {
+				probeFilter[trimmed] = struct{}{}
+			}
+		}
+
+		// If filter is provided but empty after trimming, return zero traffic
+		if len(probeFilter) == 0 {
+			logger.Info("[Traffic Fetch] Probe filter provided but no valid servers referenced, returning zero traffic")
+			return 0, 0, 0, nil
+		}
+	} else if username != "" {
+		// No explicit filter provided, check if probe binding is enabled for this user
+		userSettings, err := h.repo.GetUserSettings(ctx, username)
+		if err == nil && userSettings.EnableProbeBinding {
+			// Get all nodes for this user
+			nodes, err := h.repo.ListNodes(ctx, username)
+			if err == nil {
+				// Collect unique probe server names that are bound to nodes
+				boundProbeServers := make(map[string]struct{})
+				for _, node := range nodes {
+					name := strings.TrimSpace(node.ProbeServer)
+					if name != "" {
+						boundProbeServers[name] = struct{}{}
+					}
+				}
+
+				if len(boundProbeServers) > 0 {
+					probeFilter = boundProbeServers
+				} else {
+					logger.Info("[Traffic Fetch] Probe binding enabled but no nodes have bound servers, returning zero traffic")
+					return 0, 0, 0, nil
+				}
+			}
+		}
+	}
+
+	cfg, err := h.repo.GetProbeConfig(ctx)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	if len(cfg.Servers) == 0 {
+		return 0, 0, 0, errors.New("no probe servers configured")
+	}
+
+	// Apply probe filter if one was determined
+	if probeFilter != nil {
+		filteredServers := make([]storage.ProbeServer, 0, len(cfg.Servers))
+		for _, srv := range cfg.Servers {
+			name := strings.TrimSpace(srv.Name)
+			if name == "" {
+				continue
+			}
+			if _, ok := probeFilter[name]; ok {
+				filteredServers = append(filteredServers, srv)
+			}
+		}
+
+		if len(filteredServers) == 0 {
+			logger.Info("[Traffic Fetch] Probe filter applied but no matching servers found, returning zero traffic")
+			return 0, 0, 0, nil
+		}
+
+		cfg.Servers = filteredServers
+		logger.Info("[流量获取] 根据绑定过滤探针服务器", "count", len(cfg.Servers))
+	}
+
+	serverIDs := make([]string, 0, len(cfg.Servers))
+	for _, srv := range cfg.Servers {
+		id := strings.TrimSpace(srv.ServerID)
+		if id == "" {
+			continue
+		}
+		serverIDs = append(serverIDs, id)
+	}
+
+	if len(serverIDs) == 0 {
+		return 0, 0, 0, errors.New("no server ids configured")
+	}
+
+	logger.Info("[流量获取] 探针信息",
+		"type", cfg.ProbeType,
+		"address", cfg.Address,
+		"server_count", len(cfg.Servers),
+		"server_ids", serverIDs)
+
+	switch cfg.ProbeType {
+	case storage.ProbeTypeNezha:
+		return h.fetchNezhaTotals(ctx, cfg)
+	case storage.ProbeTypeNezhaV0:
+		return h.fetchNezhaV0Totals(ctx, cfg)
+	case storage.ProbeTypeDstatus:
+		return h.fetchBatchSummary(ctx, cfg.Address, serverIDs)
+	case storage.ProbeTypeKomari:
+		return h.fetchKomariTotals(ctx, cfg)
+	default:
+		return 0, 0, 0, fmt.Errorf("unsupported probe type: %s", cfg.ProbeType)
+	}
+}
+
+// fetchTotalsByServerIDs fetches traffic totals filtered by probe server IDs directly.
+// Unlike fetchTotals which filters by server name, this filters by server_id field.
+func (h *TrafficSummaryHandler) fetchTotalsByServerIDs(ctx context.Context, serverIDList []string) (int64, int64, int64, error) {
+	if h.repo == nil {
+		return 0, 0, 0, errors.New("traffic repository not configured")
+	}
+	if len(serverIDList) == 0 {
+		return 0, 0, 0, nil
+	}
+
+	cfg, err := h.repo.GetProbeConfig(ctx)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	allowedIDs := make(map[string]struct{}, len(serverIDList))
+	for _, id := range serverIDList {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			allowedIDs[id] = struct{}{}
+		}
+	}
+
+	filteredServers := make([]storage.ProbeServer, 0, len(cfg.Servers))
+	for _, srv := range cfg.Servers {
+		if _, ok := allowedIDs[strings.TrimSpace(srv.ServerID)]; ok {
+			filteredServers = append(filteredServers, srv)
+		}
+	}
+
+	if len(filteredServers) == 0 {
+		return 0, 0, 0, nil
+	}
+
+	cfg.Servers = filteredServers
+
+	serverIDs := make([]string, 0, len(cfg.Servers))
+	for _, srv := range cfg.Servers {
+		id := strings.TrimSpace(srv.ServerID)
+		if id != "" {
+			serverIDs = append(serverIDs, id)
+		}
+	}
+
+	switch cfg.ProbeType {
+	case storage.ProbeTypeNezha:
+		return h.fetchNezhaTotals(ctx, cfg)
+	case storage.ProbeTypeNezhaV0:
+		return h.fetchNezhaV0Totals(ctx, cfg)
+	case storage.ProbeTypeDstatus:
+		return h.fetchBatchSummary(ctx, cfg.Address, serverIDs)
+	case storage.ProbeTypeKomari:
+		return h.fetchKomariTotals(ctx, cfg)
+	default:
+		return 0, 0, 0, fmt.Errorf("unsupported probe type: %s", cfg.ProbeType)
+	}
+}
+
+func (h *TrafficSummaryHandler) fetchNezhaTotals(ctx context.Context, cfg storage.ProbeConfig) (int64, int64, int64, error) {
+	baseAddress := strings.TrimSpace(cfg.Address)
+	if baseAddress == "" {
+		return 0, 0, 0, errors.New("invalid probe address")
+	}
+
+	base, err := url.Parse(baseAddress)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("invalid probe address: %w", err)
+	}
+
+	switch strings.ToLower(base.Scheme) {
+	case "", "http":
+		base.Scheme = "ws"
+	case "https":
+		base.Scheme = "wss"
+	case "ws", "wss":
+		// keep as is
+	default:
+		base.Scheme = "wss"
+	}
+
+	endpoint := &url.URL{Path: "/api/v1/ws/server"}
+	target := base.ResolveReference(endpoint)
+
+	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.DefaultDialer.DialContext(dialCtx, target.String(), nil)
+	if err != nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return 0, 0, 0, fmt.Errorf("connect probe websocket: %w", err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return 0, 0, 0, fmt.Errorf("set websocket deadline: %w", err)
+	}
+
+	_, message, err := conn.ReadMessage()
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("read probe websocket: %w", err)
+	}
+	message = bytes.TrimSpace(message)
+	if len(message) == 0 {
+		return 0, 0, 0, errors.New("empty probe websocket payload")
+	}
+
+	type nezhaServer struct {
+		ID    json.Number `json:"id"`
+		State struct {
+			NetInTransfer  json.Number `json:"net_in_transfer"`
+			NetOutTransfer json.Number `json:"net_out_transfer"`
+		} `json:"state"`
+	}
+
+	type nezhaSnapshot struct {
+		Servers []nezhaServer `json:"servers"`
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(message))
+	decoder.UseNumber()
+
+	var snapshot nezhaSnapshot
+
+	if message[0] == '[' {
+		var frames []nezhaSnapshot
+		if err := decoder.Decode(&frames); err != nil {
+			return 0, 0, 0, fmt.Errorf("parse probe websocket payload: %w", err)
+		}
+		if len(frames) == 0 {
+			return 0, 0, 0, errors.New("probe websocket payload missing frames")
+		}
+		snapshot = frames[len(frames)-1]
+	} else {
+		if err := decoder.Decode(&snapshot); err != nil {
+			return 0, 0, 0, fmt.Errorf("parse probe websocket payload: %w", err)
+		}
+	}
+
+	observed := make(map[string]struct {
+		NetIn  int64
+		NetOut int64
+	})
+	for _, entry := range snapshot.Servers {
+		var id string
+		if v, err := entry.ID.Int64(); err == nil {
+			id = strconv.FormatInt(v, 10)
+		} else {
+			raw := strings.TrimSpace(entry.ID.String())
+			if raw != "" {
+				if strings.ContainsAny(raw, ".eE") {
+					if f, err := entry.ID.Float64(); err == nil {
+						id = strconv.FormatInt(int64(math.Round(f)), 10)
+					} else {
+						id = raw
+					}
+				} else {
+					id = raw
+				}
+			} else if f, err := entry.ID.Float64(); err == nil {
+				id = strconv.FormatInt(int64(math.Round(f)), 10)
+			}
+		}
+
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+
+		netIn := jsonNumberToInt64(entry.State.NetInTransfer)
+		netOut := jsonNumberToInt64(entry.State.NetOutTransfer)
+		observed[id] = struct {
+			NetIn  int64
+			NetOut int64
+		}{NetIn: netIn, NetOut: netOut}
+	}
+
+	var totalLimit int64
+	var totalUsed int64
+
+	logger.Info("[Nezha] 处理服务器流量", "count", len(cfg.Servers))
+
+	for _, srv := range cfg.Servers {
+		id := strings.TrimSpace(srv.ServerID)
+		if id == "" {
+			continue
+		}
+
+		totalLimit += srv.MonthlyTrafficBytes
+
+		wsEntry, ok := observed[id]
+		if !ok {
+			logger.Info("[Nezha] 服务器未在探针数据中找到", "server_id", id)
+			continue
+		}
+
+		var used int64
+		switch strings.ToLower(strings.TrimSpace(srv.TrafficMethod)) {
+		case storage.TrafficMethodUp:
+			used = wsEntry.NetOut
+		case storage.TrafficMethodDown:
+			used = wsEntry.NetIn
+		default:
+			used = wsEntry.NetIn + wsEntry.NetOut
+		}
+
+		if used < 0 {
+			used = 0
+		}
+		if srv.MonthlyTrafficBytes > 0 && used > srv.MonthlyTrafficBytes {
+			used = srv.MonthlyTrafficBytes
+		}
+
+		logger.Info("[Nezha] 服务器流量",
+			"server_id", id,
+			"net_in_gb", bytesToGigabytes(wsEntry.NetIn),
+			"net_out_gb", bytesToGigabytes(wsEntry.NetOut),
+			"method", srv.TrafficMethod,
+			"used_gb", bytesToGigabytes(used),
+			"limit_gb", bytesToGigabytes(srv.MonthlyTrafficBytes))
+
+		totalUsed += used
+	}
+
+	totalRemaining := totalLimit - totalUsed
+	if totalRemaining < 0 {
+		totalRemaining = 0
+	}
+
+	logger.Info("[Nezha] 总计流量",
+		"limit_gb", bytesToGigabytes(totalLimit),
+		"used_gb", bytesToGigabytes(totalUsed),
+		"remaining_gb", bytesToGigabytes(totalRemaining))
+
+	return totalLimit, totalRemaining, totalUsed, nil
+}
+
+func (h *TrafficSummaryHandler) fetchNezhaV0Totals(ctx context.Context, cfg storage.ProbeConfig) (int64, int64, int64, error) {
+	baseAddress := strings.TrimSpace(cfg.Address)
+	if baseAddress == "" {
+		return 0, 0, 0, errors.New("invalid probe address")
+	}
+
+	base, err := url.Parse(baseAddress)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("invalid probe address: %w", err)
+	}
+
+	endpoint := &url.URL{Path: "/api/server"}
+	target := base.ResolveReference(endpoint)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	type nezhaV0Server struct {
+		ID     json.Number `json:"id"`
+		Status struct {
+			NetInTransfer  json.Number `json:"NetInTransfer"`
+			NetOutTransfer json.Number `json:"NetOutTransfer"`
+		} `json:"status"`
+	}
+
+	type nezhaV0Response struct {
+		Result []nezhaV0Server `json:"result"`
+	}
+
+	observed := make(map[string]struct {
+		NetIn  int64
+		NetOut int64
+	})
+
+	httpSuccess := false
+	resp, httpErr := h.client.Do(req)
+	if httpErr == nil {
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			decoder := json.NewDecoder(resp.Body)
+			decoder.UseNumber()
+
+			var payload nezhaV0Response
+			if err := decoder.Decode(&payload); err == nil && len(payload.Result) > 0 {
+				httpSuccess = true
+				for _, entry := range payload.Result {
+					var id string
+					if v, err := entry.ID.Int64(); err == nil {
+						id = strconv.FormatInt(v, 10)
+					} else {
+						raw := strings.TrimSpace(entry.ID.String())
+						if raw != "" {
+							if strings.ContainsAny(raw, ".eE") {
+								if f, err := entry.ID.Float64(); err == nil {
+									id = strconv.FormatInt(int64(math.Round(f)), 10)
+								} else {
+									id = raw
+								}
+							} else {
+								id = raw
+							}
+						} else if f, err := entry.ID.Float64(); err == nil {
+							id = strconv.FormatInt(int64(math.Round(f)), 10)
+						}
+					}
+
+					id = strings.TrimSpace(id)
+					if id == "" {
+						continue
+					}
+
+					netIn := jsonNumberToInt64(entry.Status.NetInTransfer)
+					netOut := jsonNumberToInt64(entry.Status.NetOutTransfer)
+					observed[id] = struct {
+						NetIn  int64
+						NetOut int64
+					}{NetIn: netIn, NetOut: netOut}
+				}
+			}
+		}
+	}
+
+	// 如果 HTTP 接口失败或没有数据，尝试使用 WebSocket
+	if !httpSuccess {
+		wsObserved, wsErr := h.fetchNezhaV0TotalsViaWebSocket(ctx, base)
+		if wsErr != nil {
+			// WebSocket 也失败了，返回综合错误信息
+			if httpErr != nil {
+				return 0, 0, 0, fmt.Errorf("HTTP 接口失败: %w; WebSocket 接口也失败: %v", httpErr, wsErr)
+			}
+			return 0, 0, 0, fmt.Errorf("HTTP 接口未获取到数据; WebSocket 接口也失败: %v", wsErr)
+		}
+		observed = wsObserved
+		logger.Info("[Nezha V0] Using WebSocket data as HTTP API failed or returned no data")
+	}
+
+	var totalLimit int64
+	var totalUsed int64
+
+	logger.Info("[Nezha V0] 处理服务器流量", "count", len(cfg.Servers))
+
+	for _, srv := range cfg.Servers {
+		id := strings.TrimSpace(srv.ServerID)
+		if id == "" {
+			continue
+		}
+
+		totalLimit += srv.MonthlyTrafficBytes
+
+		entry, ok := observed[id]
+		if !ok {
+			logger.Info("[Nezha V0] 服务器未在探针数据中找到", "server_id", id)
+			continue
+		}
+
+		var used int64
+		switch strings.ToLower(strings.TrimSpace(srv.TrafficMethod)) {
+		case storage.TrafficMethodUp:
+			used = entry.NetOut
+		case storage.TrafficMethodDown:
+			used = entry.NetIn
+		default:
+			used = entry.NetIn + entry.NetOut
+		}
+
+		if used < 0 {
+			used = 0
+		}
+		if srv.MonthlyTrafficBytes > 0 && used > srv.MonthlyTrafficBytes {
+			used = srv.MonthlyTrafficBytes
+		}
+
+		logger.Info("[Nezha V0] 服务器流量",
+			"server_id", id,
+			"net_in_gb", bytesToGigabytes(entry.NetIn),
+			"net_out_gb", bytesToGigabytes(entry.NetOut),
+			"method", srv.TrafficMethod,
+			"used_gb", bytesToGigabytes(used),
+			"limit_gb", bytesToGigabytes(srv.MonthlyTrafficBytes))
+
+		totalUsed += used
+	}
+
+	totalRemaining := totalLimit - totalUsed
+	if totalRemaining < 0 {
+		totalRemaining = 0
+	}
+
+	logger.Info("[Nezha V0] 总计流量",
+		"limit_gb", bytesToGigabytes(totalLimit),
+		"used_gb", bytesToGigabytes(totalUsed),
+		"remaining_gb", bytesToGigabytes(totalRemaining))
+
+	return totalLimit, totalRemaining, totalUsed, nil
+}
+
+func (h *TrafficSummaryHandler) fetchBatchSummary(ctx context.Context, address string, serverIDs []string) (int64, int64, int64, error) {
+	base, err := url.Parse(strings.TrimSpace(address))
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("invalid probe address: %w", err)
+	}
+
+	return h.fetchBatchTraffic(ctx, base, serverIDs)
+}
+
+func (h *TrafficSummaryHandler) fetchKomariTotals(ctx context.Context, cfg storage.ProbeConfig) (int64, int64, int64, error) {
+	baseAddress := strings.TrimSpace(cfg.Address)
+	if baseAddress == "" {
+		return 0, 0, 0, errors.New("invalid probe address")
+	}
+
+	base, err := url.Parse(baseAddress)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("invalid probe address: %w", err)
+	}
+
+	endpoint := &url.URL{Path: "/api/rpc2"}
+	target := base.ResolveReference(endpoint)
+
+	// Prepare JSON-RPC request
+	rpcRequest := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "common:getNodesLatestStatus",
+		"id":      3,
+	}
+
+	requestBody, err := json.Marshal(rpcRequest)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("marshal komari request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), bytes.NewReader(requestBody))
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("komari request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, 0, fmt.Errorf("komari request failed with status %s", resp.Status)
+	}
+
+	type komariResponse struct {
+		Result map[string]struct {
+			NetTotalUp   json.Number `json:"net_total_up"`
+			NetTotalDown json.Number `json:"net_total_down"`
+		} `json:"result"`
+	}
+
+	decoder := json.NewDecoder(resp.Body)
+	decoder.UseNumber()
+
+	var payload komariResponse
+	if err := decoder.Decode(&payload); err != nil {
+		return 0, 0, 0, fmt.Errorf("parse komari response: %w", err)
+	}
+
+	observed := make(map[string]struct {
+		Up   int64
+		Down int64
+	})
+	for id, info := range payload.Result {
+		cleanID := strings.TrimSpace(id)
+		if cleanID == "" {
+			continue
+		}
+
+		up := jsonNumberToInt64(info.NetTotalUp)
+		if up < 0 {
+			up = 0
+		}
+		down := jsonNumberToInt64(info.NetTotalDown)
+		if down < 0 {
+			down = 0
+		}
+
+		observed[cleanID] = struct {
+			Up   int64
+			Down int64
+		}{Up: up, Down: down}
+	}
+
+	var totalLimit int64
+	var totalUsed int64
+
+	logger.Info("[Komari] 处理服务器流量", "count", len(cfg.Servers))
+
+	for _, srv := range cfg.Servers {
+		id := strings.TrimSpace(srv.ServerID)
+		if id == "" {
+			continue
+		}
+
+		totalLimit += srv.MonthlyTrafficBytes
+
+		usage, ok := observed[id]
+		if !ok {
+			logger.Info("[Komari] 服务器未在探针数据中找到", "server_id", id)
+			continue
+		}
+
+		var used int64
+		switch strings.ToLower(strings.TrimSpace(srv.TrafficMethod)) {
+		case storage.TrafficMethodUp:
+			used = usage.Up
+		case storage.TrafficMethodDown:
+			used = usage.Down
+		default:
+			used = usage.Up + usage.Down
+		}
+
+		if used < 0 {
+			used = 0
+		}
+		if srv.MonthlyTrafficBytes > 0 && used > srv.MonthlyTrafficBytes {
+			used = srv.MonthlyTrafficBytes
+		}
+
+		logger.Info("[Komari] 服务器流量",
+			"server_id", id,
+			"up_gb", bytesToGigabytes(usage.Up),
+			"down_gb", bytesToGigabytes(usage.Down),
+			"method", srv.TrafficMethod,
+			"used_gb", bytesToGigabytes(used),
+			"limit_gb", bytesToGigabytes(srv.MonthlyTrafficBytes))
+
+		totalUsed += used
+	}
+
+	totalRemaining := totalLimit - totalUsed
+	if totalRemaining < 0 {
+		totalRemaining = 0
+	}
+
+	logger.Info("[Komari] 总计流量",
+		"limit_gb", bytesToGigabytes(totalLimit),
+		"used_gb", bytesToGigabytes(totalUsed),
+		"remaining_gb", bytesToGigabytes(totalRemaining))
+
+	return totalLimit, totalRemaining, totalUsed, nil
+}
+
+func (h *TrafficSummaryHandler) fetchBatchTraffic(ctx context.Context, base *url.URL, serverIDs []string) (int64, int64, int64, error) {
+	payload, err := json.Marshal(map[string][]string{"serverIds": serverIDs})
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	endpoint := &url.URL{Path: "/stats/batch-traffic"}
+	target := base.ResolveReference(endpoint)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), bytes.NewReader(payload))
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "miaomiaowux/0.1")
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, 0, errors.New("batch traffic request failed with status " + resp.Status)
+	}
+
+	decoder := json.NewDecoder(resp.Body)
+	decoder.UseNumber()
+
+	var payloadResp batchTrafficResponse
+	if err := decoder.Decode(&payloadResp); err != nil {
+		return 0, 0, 0, err
+	}
+
+	if !payloadResp.Success {
+		if payloadResp.Message != "" {
+			return 0, 0, 0, errors.New(payloadResp.Message)
+		}
+		return 0, 0, 0, errors.New("batch traffic request unsuccessful")
+	}
+
+	var totalLimit int64
+	var totalRemaining int64
+	var totalUsed int64
+
+	logger.Info("[Dstatus] 处理服务器流量", "count", len(payloadResp.Data))
+
+	for serverID, entry := range payloadResp.Data {
+		limit := jsonNumberToInt64(entry.Monthly.Limit)
+		used := jsonNumberToInt64(entry.Monthly.Used)
+		remaining := jsonNumberToInt64(entry.Monthly.Remaining)
+
+		logger.Info("[Dstatus] 服务器流量",
+			"server_id", serverID,
+			"limit_gb", bytesToGigabytes(limit),
+			"used_gb", bytesToGigabytes(used),
+			"remaining_gb", bytesToGigabytes(remaining))
+
+		totalLimit += limit
+		totalRemaining += remaining
+		totalUsed += used
+	}
+
+	logger.Info("[Dstatus] 总计流量",
+		"limit_gb", bytesToGigabytes(totalLimit),
+		"used_gb", bytesToGigabytes(totalUsed),
+		"remaining_gb", bytesToGigabytes(totalRemaining))
+
+	return totalLimit, totalRemaining, totalUsed, nil
+}
+
+func jsonNumberToInt64(n json.Number) int64 {
+	if n == "" {
+		return 0
+	}
+	if v, err := n.Int64(); err == nil {
+		return v
+	}
+	if f, err := n.Float64(); err == nil {
+		if f < 0 {
+			return int64(f - 0.5)
+		}
+		return int64(f + 0.5)
+	}
+	return 0
 }
 
 func roundUpTwoDecimals(value float64) float64 {
@@ -418,15 +1135,6 @@ func (h *TrafficSummaryHandler) loadHistory(ctx context.Context, days int) ([]tr
 		return nil, nil
 	}
 
-	// 优先用 per-server 快照差分 —— 它对月度重置免疫(见 ListServerDailyCumulative 的说明)。
-	// 快照表要等 daily_snapshot 任务跑过才有数据,所以拿不到时回落到老的
-	// traffic_records 总量差分(重置日会是断点,但至少正常日子的数字是对的)。
-	if usages, err := h.loadHistoryFromSnapshots(ctx, days); err == nil && len(usages) > 0 {
-		return usages, nil
-	} else if err != nil {
-		logger.Warn("[流量统计] 快照差分失败,回落总量差分", "error", err)
-	}
-
 	records, err := h.repo.ListRecent(ctx, days)
 	if err != nil {
 		return nil, err
@@ -449,135 +1157,42 @@ func (h *TrafficSummaryHandler) loadHistory(ctx context.Context, days int) ([]tr
 		if hasPrev {
 			delta = record.TotalUsed - prevUsed
 			if delta < 0 {
-				// 累计值倒退 = 期间发生了流量重置(某台机的 offset 被改成 -aggregated)。
-				//
-				// 这一天的真实用量在累计值模型下**算不出来**:total_used 是所有服务器
-				// aggregated+offset 的总和,一台机重置只让总和下降一截,既无法从中分离出
-				// "重置掉多少",也就无法还原"当天实际用了多少"。
-				//
-				// 早先钳成 0 会谎称"当天没流量";换成 record.TotalUsed 更糟 ——
-				// 那是全部服务器的累计总量,会画出几百上千 GB 的假尖峰。
-				// 唯一诚实的做法是标记为不可用,让前端断线。
-				logger.Warn("[流量统计] 累计值倒退(疑似流量重置),当日用量不可计算",
-					"date", record.Date.Format("2006-01-02"),
-					"prev_used", prevUsed, "current_used", record.TotalUsed)
-				prevUsed = record.TotalUsed
-				hasPrev = true
-				usages = append(usages, trafficDailyUsage{
-					Date:   record.Date.Format("2006-01-02"),
-					UsedGB: nil,
-				})
-				continue
+				delta = 0
 			}
 		}
 
 		prevUsed = record.TotalUsed
 		hasPrev = true
 
-		gb := roundUpTwoDecimals(bytesToGigabytes(delta))
 		usages = append(usages, trafficDailyUsage{
 			Date:   record.Date.Format("2006-01-02"),
-			UsedGB: &gb,
+			UsedGB: roundUpTwoDecimals(bytesToGigabytes(delta)),
 		})
 	}
 
-	return fillMissingDays(usages), nil
+	return usages, nil
 }
 
-// fillMissingDays 把首尾之间缺失的日历日补成 UsedGB=nil 的空点。
-// 缺失 = 那天既没跑成定时快照、也没有 admin 访问过后台。原先这些日期直接从数组里消失,
-// X 轴悄悄跳过,看起来像"数据连续"实则有洞;补成 null 后图上是断点,一眼可辨。
-func fillMissingDays(usages []trafficDailyUsage) []trafficDailyUsage {
-	if len(usages) < 2 {
-		return usages
-	}
-	first, err1 := time.Parse("2006-01-02", usages[0].Date)
-	last, err2 := time.Parse("2006-01-02", usages[len(usages)-1].Date)
-	if err1 != nil || err2 != nil {
-		return usages
-	}
-	// 防御:异常跨度(如脏数据把日期写到几年前)时不展开,免得生成上万个空点。
-	if last.Sub(first) > 400*24*time.Hour {
-		return usages
-	}
-	byDate := make(map[string]trafficDailyUsage, len(usages))
-	for _, u := range usages {
-		byDate[u.Date] = u
-	}
-	out := make([]trafficDailyUsage, 0, len(usages))
-	for d := first; !d.After(last); d = d.AddDate(0, 0, 1) {
-		key := d.Format("2006-01-02")
-		if u, ok := byDate[key]; ok {
-			out = append(out, u)
-		} else {
-			out = append(out, trafficDailyUsage{Date: key, UsedGB: nil})
-		}
-	}
-	return out
-}
-
-func (h *TrafficSummaryHandler) loadUserHistory(ctx context.Context, username string, days int) ([]trafficDailyUsage, error) {
-	if h.repo == nil {
-		return nil, nil
-	}
-	records, err := h.repo.ListUserRecent(ctx, username, days)
-	if err != nil {
-		return nil, err
-	}
-	if len(records) == 0 {
-		return nil, nil
-	}
-	sort.SliceStable(records, func(i, j int) bool {
-		return records[i].Date.Before(records[j].Date)
-	})
-	usages := make([]trafficDailyUsage, 0, len(records))
-	var prevUsed int64
-	var hasPrev bool
-	for _, record := range records {
-		delta := record.TotalUsed
-		if hasPrev {
-			delta = record.TotalUsed - prevUsed
-			if delta < 0 {
-				// 同 loadHistory:累计值倒退时当日用量不可计算,置 null 让前端断线。
-				prevUsed = record.TotalUsed
-				hasPrev = true
-				usages = append(usages, trafficDailyUsage{
-					Date:   record.Date.Format("2006-01-02"),
-					UsedGB: nil,
-				})
-				continue
-			}
-		}
-		prevUsed = record.TotalUsed
-		hasPrev = true
-		gb := roundUpTwoDecimals(bytesToGigabytes(delta))
-		usages = append(usages, trafficDailyUsage{
-			Date:   record.Date.Format("2006-01-02"),
-			UsedGB: &gb,
-		})
-	}
-	return fillMissingDays(usages), nil
-}
-
-// fetchExternalSubscriptionTraffic 从外部订阅中获取订阅文件中实际使用的流量
-// 返回未过期订阅（或没有过期日期的长期订阅）的totalLimit和totalUsed
+// fetchExternalSubscriptionTraffic fetches traffic from external subscriptions that are actually used in subscription files
+// Returns totalLimit and totalUsed from non-expired subscriptions (or long-term subscriptions without expire date)
 func (h *TrafficSummaryHandler) fetchExternalSubscriptionTraffic(ctx context.Context, username string) (int64, int64) {
-	// 检查sync_traffic是否启用
+	// Check if sync_traffic is enabled
 	settings, err := h.repo.GetUserSettings(ctx, username)
 	if err != nil || !settings.SyncTraffic {
 		return 0, 0
 	}
 
+	// Get all subscription files for this user
 	subscribeFiles, err := h.repo.ListSubscribeFiles(ctx)
 	if err != nil {
 		logger.Info("[流量] 获取订阅文件列表失败", "error", err)
 		return 0, 0
 	}
 
-	// 收集所有订阅文件中使用的所有外部订阅 URL
+	// Collect all external subscription URLs used across all subscription files
 	usedExternalURLs := make(map[string]bool)
 	for _, file := range subscribeFiles {
-		// 读取订阅文件内容
+		// Read subscription file content
 		filePath := filepath.Join("subscribes", file.Filename)
 		data, err := os.ReadFile(filePath)
 		if err != nil {
@@ -585,14 +1200,14 @@ func (h *TrafficSummaryHandler) fetchExternalSubscriptionTraffic(ctx context.Con
 			continue
 		}
 
-		// 获取此文件中引用的外部订阅 URL
+		// Get external subscription URLs referenced in this file
 		fileURLs, err := GetExternalSubscriptionsFromFile(ctx, data, username, h.repo)
 		if err != nil {
 			logger.Info("[流量] 解析订阅文件失败", "filename", file.Filename, "error", err)
 			continue
 		}
 
-		// 合并到使用过的 URL
+		// Merge into used URLs
 		for url := range fileURLs {
 			usedExternalURLs[url] = true
 		}
@@ -605,7 +1220,7 @@ func (h *TrafficSummaryHandler) fetchExternalSubscriptionTraffic(ctx context.Con
 
 	logger.Info("[流量] 找到使用中的外部订阅", "count", len(usedExternalURLs))
 
-	// 获取所有外部订阅
+	// Get all external subscriptions
 	subs, err := h.repo.ListExternalSubscriptions(ctx, username)
 	if err != nil {
 		logger.Info("[流量] 获取外部订阅失败", "error", err)
@@ -617,29 +1232,44 @@ func (h *TrafficSummaryHandler) fetchExternalSubscriptionTraffic(ctx context.Con
 	now := time.Now()
 
 	for _, sub := range subs {
-		// 如果此订阅未在任何订阅文件中使用，则跳过
+		// Skip if this subscription is not used in any subscription file
 		if !usedExternalURLs[sub.URL] {
 			continue
 		}
 
-		// 如果订阅已过期则跳过
-		// 如果 Expire 为 nil，则为长期订阅，不应跳过
+		// Skip if subscription is expired
+		// If Expire is nil, it's a long-term subscription and should not be skipped
 		if sub.Expire != nil && sub.Expire.Before(now) {
 			logger.Info("[流量] 跳过已过期订阅", "name", sub.Name, "expired_at", sub.Expire.Format("2006-01-02 15:04:05"))
 			continue
 		}
 
-		// 添加来自此订阅的流量
+		// Skip subscriptions with traffic mode "none"
+		if strings.ToLower(strings.TrimSpace(sub.TrafficMode)) == "none" {
+			logger.Info("[流量] 跳过不统计订阅", "name", sub.Name)
+			continue
+		}
+
+		// Add traffic from this subscription based on TrafficMode
+		var used int64
+		switch strings.ToLower(strings.TrimSpace(sub.TrafficMode)) {
+		case "download":
+			used = sub.Download
+		case "upload":
+			used = sub.Upload
+		default: // "both" or empty
+			used = sub.Upload + sub.Download
+		}
 		totalLimit += sub.Total
-		totalUsed += sub.Upload + sub.Download
+		totalUsed += used
 
 		if sub.Expire == nil {
-			logger.Info("[流量] 添加长期订阅流量", "name", sub.Name, "limit", sub.Total, "used", sub.Upload+sub.Download)
+			logger.Info("[流量] 添加长期订阅流量", "name", sub.Name, "limit", sub.Total, "used", used)
 		} else {
 			logger.Info("[流量] 添加订阅流量",
 				"name", sub.Name,
 				"limit", sub.Total,
-				"used", sub.Upload+sub.Download,
+				"used", used,
 				"expires", sub.Expire.Format("2006-01-02 15:04:05"))
 		}
 	}
@@ -648,56 +1278,625 @@ func (h *TrafficSummaryHandler) fetchExternalSubscriptionTraffic(ctx context.Con
 	return totalLimit, totalUsed
 }
 
-// loadHistoryFromSnapshots 用 per-server 快照算每日流量:每台机各自做日间差分,再按天求和。
-//
-// 关键在"各自差分":某台机月度重置(或 agent 重装导致 node_traffic 归零)时,只有它那条
-// 序列会出现倒退,单独归零处理即可,不会像总量差分那样把整天的数据毁掉。
-func (h *TrafficSummaryHandler) loadHistoryFromSnapshots(ctx context.Context, days int) ([]trafficDailyUsage, error) {
-	rows, err := h.repo.ListServerDailyCumulative(ctx, days)
+func (h *TrafficSummaryHandler) fetchNezhaV0TotalsViaWebSocket(ctx context.Context, base *url.URL) (map[string]struct {
+	NetIn  int64
+	NetOut int64
+}, error) {
+	// 转换 scheme 为 WebSocket
+	wsBase := *base // 复制以避免修改原始 URL
+	switch strings.ToLower(wsBase.Scheme) {
+	case "", "http":
+		wsBase.Scheme = "ws"
+	case "https":
+		wsBase.Scheme = "wss"
+	case "ws", "wss":
+		// keep as is
+	default:
+		wsBase.Scheme = "wss"
+	}
+
+	endpoint := &url.URL{Path: "/ws"}
+	target := wsBase.ResolveReference(endpoint)
+
+	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.DefaultDialer.DialContext(dialCtx, target.String(), nil)
+	if err != nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return nil, fmt.Errorf("无法连接到 WebSocket 接口: %w", err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return nil, fmt.Errorf("set websocket deadline: %w", err)
+	}
+
+	_, message, err := conn.ReadMessage()
+	if err != nil {
+		return nil, fmt.Errorf("未在期望时间内收到服务器数据: %w", err)
+	}
+
+	message = bytes.TrimSpace(message)
+	if len(message) == 0 {
+		return nil, errors.New("empty probe websocket payload")
+	}
+
+	type nezhaServer struct {
+		ID     json.Number `json:"id"`
+		Status struct {
+			NetInTransfer  json.Number `json:"NetInTransfer"`
+			NetOutTransfer json.Number `json:"NetOutTransfer"`
+		} `json:"State"`
+	}
+
+	type nezhaSnapshot struct {
+		Servers []nezhaServer `json:"servers"`
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(message))
+	decoder.UseNumber()
+
+	var snapshot nezhaSnapshot
+
+	if message[0] == '[' {
+		var frames []nezhaSnapshot
+		if err := decoder.Decode(&frames); err != nil {
+			return nil, fmt.Errorf("解析探针返回数据失败: %w", err)
+		}
+		if len(frames) == 0 {
+			return nil, errors.New("探针未返回任何服务器数据")
+		}
+		snapshot = frames[len(frames)-1]
+	} else {
+		if err := decoder.Decode(&snapshot); err != nil {
+			return nil, fmt.Errorf("解析探针返回数据失败: %w", err)
+		}
+	}
+
+	if len(snapshot.Servers) == 0 {
+		return nil, errors.New("探针未返回任何服务器数据")
+	}
+
+	observed := make(map[string]struct {
+		NetIn  int64
+		NetOut int64
+	})
+
+	for _, entry := range snapshot.Servers {
+		var id string
+		if v, err := entry.ID.Int64(); err == nil {
+			id = strconv.FormatInt(v, 10)
+		} else {
+			raw := strings.TrimSpace(entry.ID.String())
+			if raw != "" {
+				if strings.ContainsAny(raw, ".eE") {
+					if f, err := entry.ID.Float64(); err == nil {
+						id = strconv.FormatInt(int64(math.Round(f)), 10)
+					} else {
+						id = raw
+					}
+				} else {
+					id = raw
+				}
+			} else if f, err := entry.ID.Float64(); err == nil {
+				id = strconv.FormatInt(int64(math.Round(f)), 10)
+			}
+		}
+
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+
+		netIn := jsonNumberToInt64(entry.Status.NetInTransfer)
+		netOut := jsonNumberToInt64(entry.Status.NetOutTransfer)
+		observed[id] = struct {
+			NetIn  int64
+			NetOut int64
+		}{NetIn: netIn, NetOut: netOut}
+	}
+
+	return observed, nil
+}
+
+func writeError(w http.ResponseWriter, status int, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error": err.Error(),
+	})
+}
+
+// HandleSubscribeTraffic returns traffic data for subscribe files that have
+// traffic_limit or stats_server_ids configured, plus the overall probe totals.
+func (h *TrafficSummaryHandler) HandleSubscribeTraffic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("only GET is supported"))
+		return
+	}
+
+	ctx := r.Context()
+	files, err := h.repo.ListSubscribeFiles(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	type subTraffic struct {
+		ID      int64   `json:"id"`
+		LimitGB float64 `json:"limit_gb"`
+		UsedGB  float64 `json:"used_gb"`
+	}
+
+	type probeTotal struct {
+		LimitGB float64 `json:"limit_gb"`
+		UsedGB  float64 `json:"used_gb"`
+	}
+
+	type response struct {
+		Items      []subTraffic `json:"items"`
+		ProbeTotal *probeTotal  `json:"probe_total,omitempty"`
+	}
+
+	var items []subTraffic
+
+	for _, f := range files {
+		if f.TrafficLimit == nil && f.StatsServerIDs == "" {
+			continue
+		}
+
+		var limitBytes, usedBytes int64
+
+		if f.StatsServerIDs != "" {
+			idList := strings.Split(f.StatsServerIDs, ",")
+			statsLimit, _, statsUsed, statsErr := h.fetchTotalsByServerIDs(ctx, idList)
+			if statsErr == nil {
+				if f.TrafficLimit != nil {
+					limitBytes = int64(*f.TrafficLimit * bytesPerGigabyte)
+				} else {
+					limitBytes = statsLimit
+				}
+				usedBytes = statsUsed
+			}
+		} else if f.TrafficLimit != nil {
+			limitBytes = int64(*f.TrafficLimit * bytesPerGigabyte)
+			_, _, totalUsed, probeErr := h.fetchTotals(ctx, "", nil)
+			if probeErr == nil {
+				usedBytes = totalUsed
+			}
+		}
+
+		items = append(items, subTraffic{
+			ID:      f.ID,
+			LimitGB: roundUpTwoDecimals(bytesToGigabytes(limitBytes)),
+			UsedGB:  roundUpTwoDecimals(bytesToGigabytes(usedBytes)),
+		})
+	}
+
+	resp := response{Items: items}
+
+	// Fetch probe total traffic as default
+	probeLimit, _, probeUsed, probeErr := h.fetchTotals(ctx, "", nil)
+	if probeErr == nil {
+		resp.ProbeTotal = &probeTotal{
+			LimitGB: roundUpTwoDecimals(bytesToGigabytes(probeLimit)),
+			UsedGB:  roundUpTwoDecimals(bytesToGigabytes(probeUsed)),
+		}
+	}
+
+	respondJSON(w, http.StatusOK, resp)
+}
+
+// ServerTraffic holds per-server traffic data for notification display.
+type ServerTraffic struct {
+	Name    string
+	LimitGB float64
+	UsedGB  float64
+}
+
+// FetchTrafficSummaryForNotify returns overall totals, per-probe-server breakdown, and external subscription breakdown.
+func (h *TrafficSummaryHandler) FetchTrafficSummaryForNotify(ctx context.Context) (totalLimitGB, totalUsedGB float64, probeServers, extSubs []ServerTraffic, err error) {
+	var totalLimit, totalUsed int64
+
+	cfg, cfgErr := h.repo.GetProbeConfig(ctx)
+	if cfgErr == nil && len(cfg.Servers) > 0 {
+		limit, _, used, fetchErr := h.fetchTotals(ctx, "", nil)
+		if fetchErr == nil {
+			totalLimit += limit
+			totalUsed += used
+			perServer, perErr := h.fetchPerServerTraffic(ctx, cfg)
+			if perErr == nil {
+				probeServers = perServer
+			}
+		}
+	}
+
+	extSubs = h.fetchExternalSubsForNotify(ctx)
+	for _, s := range extSubs {
+		totalLimit += int64(s.LimitGB * bytesPerGigabyte)
+		totalUsed += int64(s.UsedGB * bytesPerGigabyte)
+	}
+
+	totalLimitGB = roundUpTwoDecimals(bytesToGigabytes(totalLimit))
+	totalUsedGB = roundUpTwoDecimals(bytesToGigabytes(totalUsed))
+	return
+}
+
+func (h *TrafficSummaryHandler) fetchExternalSubsForNotify(ctx context.Context) []ServerTraffic {
+	enabled, err := h.repo.IsSyncTrafficEnabled(ctx)
+	if err != nil || !enabled {
+		return nil
+	}
+	subs, err := h.repo.ListAllExternalSubscriptions(ctx)
+	if err != nil || len(subs) == 0 {
+		return nil
+	}
+	now := time.Now()
+	var result []ServerTraffic
+	for _, sub := range subs {
+		if sub.Expire != nil && sub.Expire.Before(now) {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(sub.TrafficMode)) == "none" {
+			continue
+		}
+		var used int64
+		switch strings.ToLower(strings.TrimSpace(sub.TrafficMode)) {
+		case "download":
+			used = sub.Download
+		case "upload":
+			used = sub.Upload
+		default:
+			used = sub.Upload + sub.Download
+		}
+		result = append(result, ServerTraffic{
+			Name:    sub.Name,
+			LimitGB: roundUpTwoDecimals(bytesToGigabytes(sub.Total)),
+			UsedGB:  roundUpTwoDecimals(bytesToGigabytes(used)),
+		})
+	}
+	return result
+}
+
+func (h *TrafficSummaryHandler) fetchPerServerTraffic(ctx context.Context, cfg storage.ProbeConfig) ([]ServerTraffic, error) {
+	switch cfg.ProbeType {
+	case storage.ProbeTypeNezha:
+		return h.fetchNezhaPerServer(ctx, cfg)
+	case storage.ProbeTypeNezhaV0:
+		return h.fetchNezhaV0PerServer(ctx, cfg)
+	case storage.ProbeTypeDstatus:
+		return h.fetchDstatusPerServer(ctx, cfg)
+	case storage.ProbeTypeKomari:
+		return h.fetchKomariPerServer(ctx, cfg)
+	default:
+		return nil, nil
+	}
+}
+
+func (h *TrafficSummaryHandler) fetchNezhaPerServer(ctx context.Context, cfg storage.ProbeConfig) ([]ServerTraffic, error) {
+	baseAddress := strings.TrimSpace(cfg.Address)
+	if baseAddress == "" {
+		return nil, nil
+	}
+
+	base, err := url.Parse(baseAddress)
 	if err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 {
+
+	switch strings.ToLower(base.Scheme) {
+	case "", "http":
+		base.Scheme = "ws"
+	case "https":
+		base.Scheme = "wss"
+	case "ws", "wss":
+	default:
+		base.Scheme = "wss"
+	}
+
+	endpoint := &url.URL{Path: "/api/v1/ws/server"}
+	target := base.ResolveReference(endpoint)
+
+	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.DefaultDialer.DialContext(dialCtx, target.String(), nil)
+	if err != nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return nil, err
+	}
+	defer conn.Close()
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return nil, err
+	}
+
+	_, message, err := conn.ReadMessage()
+	if err != nil {
+		return nil, err
+	}
+	message = bytes.TrimSpace(message)
+	if len(message) == 0 {
 		return nil, nil
 	}
 
-	// serverID -> 上一天的累计值。rows 已按 (server_id, date) 排好序。
-	prev := make(map[int64]int64, 16)
-	seen := make(map[int64]bool, 16)
-	perDate := make(map[string]int64, days+1)
-
-	for _, r := range rows {
-		if !seen[r.ServerID] {
-			// 该服务器的第一条只作基线,不产生增量 —— 否则会把它的历史累计量
-			// 一次性算进这一天,又是一根假尖峰。
-			seen[r.ServerID] = true
-			prev[r.ServerID] = r.Used
-			continue
-		}
-		delta := r.Used - prev[r.ServerID]
-		prev[r.ServerID] = r.Used
-		if delta < 0 {
-			// 单机累计值倒退:agent 重装 / xray 重置计数器。当天该机的量无从还原,
-			// 计 0 而不是负数;影响面被限制在这一台机,不波及当天其它机器。
-			continue
-		}
-		perDate[r.Date] += delta
+	type nezhaServer struct {
+		ID    json.Number `json:"id"`
+		State struct {
+			NetInTransfer  json.Number `json:"net_in_transfer"`
+			NetOutTransfer json.Number `json:"net_out_transfer"`
+		} `json:"state"`
+	}
+	type nezhaSnapshot struct {
+		Servers []nezhaServer `json:"servers"`
 	}
 
-	if len(perDate) == 0 {
+	decoder := json.NewDecoder(bytes.NewReader(message))
+	decoder.UseNumber()
+
+	var snapshot nezhaSnapshot
+	if message[0] == '[' {
+		var frames []nezhaSnapshot
+		if err := decoder.Decode(&frames); err != nil {
+			return nil, err
+		}
+		if len(frames) == 0 {
+			return nil, nil
+		}
+		snapshot = frames[len(frames)-1]
+	} else {
+		if err := decoder.Decode(&snapshot); err != nil {
+			return nil, err
+		}
+	}
+
+	observed := make(map[string]struct{ NetIn, NetOut int64 })
+	for _, entry := range snapshot.Servers {
+		id := normalizeServerID(entry.ID)
+		if id == "" {
+			continue
+		}
+		observed[id] = struct{ NetIn, NetOut int64 }{
+			NetIn:  jsonNumberToInt64(entry.State.NetInTransfer),
+			NetOut: jsonNumberToInt64(entry.State.NetOutTransfer),
+		}
+	}
+
+	return buildPerServerResult(cfg.Servers, observed), nil
+}
+
+func (h *TrafficSummaryHandler) fetchNezhaV0PerServer(ctx context.Context, cfg storage.ProbeConfig) ([]ServerTraffic, error) {
+	baseAddress := strings.TrimSpace(cfg.Address)
+	if baseAddress == "" {
 		return nil, nil
 	}
 
-	dates := make([]string, 0, len(perDate))
-	for d := range perDate {
-		dates = append(dates, d)
+	base, err := url.Parse(baseAddress)
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(dates)
 
-	usages := make([]trafficDailyUsage, 0, len(dates))
-	for _, d := range dates {
-		gb := roundUpTwoDecimals(bytesToGigabytes(perDate[d]))
-		usages = append(usages, trafficDailyUsage{Date: d, UsedGB: &gb})
+	switch strings.ToLower(base.Scheme) {
+	case "", "http":
+		base.Scheme = "ws"
+	case "https":
+		base.Scheme = "wss"
+	case "ws", "wss":
+	default:
+		base.Scheme = "wss"
 	}
-	return fillMissingDays(usages), nil
+
+	endpoint := &url.URL{Path: "/ws"}
+	target := base.ResolveReference(endpoint)
+
+	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	conn, resp, err := websocket.DefaultDialer.DialContext(dialCtx, target.String(), nil)
+	if err != nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return nil, err
+	}
+	defer conn.Close()
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return nil, err
+	}
+
+	_, message, err := conn.ReadMessage()
+	if err != nil {
+		return nil, err
+	}
+	message = bytes.TrimSpace(message)
+	if len(message) == 0 {
+		return nil, nil
+	}
+
+	type v0Server struct {
+		ID    json.Number `json:"id"`
+		State struct {
+			NetInTransfer  json.Number `json:"net_in_transfer"`
+			NetOutTransfer json.Number `json:"net_out_transfer"`
+		} `json:"state"`
+	}
+	type v0Data struct {
+		Servers map[string]*v0Server `json:"servers"`
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(message))
+	decoder.UseNumber()
+
+	var data v0Data
+	if err := decoder.Decode(&data); err != nil {
+		return nil, err
+	}
+
+	observed := make(map[string]struct{ NetIn, NetOut int64 })
+	for _, entry := range data.Servers {
+		if entry == nil {
+			continue
+		}
+		id := normalizeServerID(entry.ID)
+		if id == "" {
+			continue
+		}
+		observed[id] = struct{ NetIn, NetOut int64 }{
+			NetIn:  jsonNumberToInt64(entry.State.NetInTransfer),
+			NetOut: jsonNumberToInt64(entry.State.NetOutTransfer),
+		}
+	}
+
+	return buildPerServerResult(cfg.Servers, observed), nil
+}
+
+func (h *TrafficSummaryHandler) fetchDstatusPerServer(ctx context.Context, cfg storage.ProbeConfig) ([]ServerTraffic, error) {
+	serverIDs := make([]string, 0, len(cfg.Servers))
+	for _, srv := range cfg.Servers {
+		id := strings.TrimSpace(srv.ServerID)
+		if id != "" {
+			serverIDs = append(serverIDs, id)
+		}
+	}
+	if len(serverIDs) == 0 {
+		return nil, nil
+	}
+
+	reqURL := fmt.Sprintf("%s/api/traffic/batch?ids=%s", strings.TrimRight(cfg.Address, "/"), strings.Join(serverIDs, ","))
+	resp, err := h.client.Get(reqURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var batchResp batchTrafficResponse
+	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
+		return nil, err
+	}
+
+	observed := make(map[string]struct{ NetIn, NetOut int64 })
+	for id, data := range batchResp.Data {
+		used, _ := data.Monthly.Used.Int64()
+		observed[id] = struct{ NetIn, NetOut int64 }{NetIn: used, NetOut: 0}
+	}
+
+	// For dstatus, traffic method is effectively "down" (used = download)
+	var result []ServerTraffic
+	for _, srv := range cfg.Servers {
+		id := strings.TrimSpace(srv.ServerID)
+		if id == "" {
+			continue
+		}
+		entry, ok := observed[id]
+		if !ok {
+			continue
+		}
+		result = append(result, ServerTraffic{
+			Name:    srv.Name,
+			LimitGB: roundUpTwoDecimals(bytesToGigabytes(srv.MonthlyTrafficBytes)),
+			UsedGB:  roundUpTwoDecimals(bytesToGigabytes(entry.NetIn)),
+		})
+	}
+	return result, nil
+}
+
+func (h *TrafficSummaryHandler) fetchKomariPerServer(ctx context.Context, cfg storage.ProbeConfig) ([]ServerTraffic, error) {
+	baseAddress := strings.TrimSpace(cfg.Address)
+	if baseAddress == "" {
+		return nil, nil
+	}
+
+	reqURL := fmt.Sprintf("%s/api/v1/servers", strings.TrimRight(baseAddress, "/"))
+	resp, err := h.client.Get(reqURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	type komariStatus struct {
+		NetInTransfer  json.Number `json:"net_in_transfer"`
+		NetOutTransfer json.Number `json:"net_out_transfer"`
+	}
+	type komariServer struct {
+		ID     json.Number  `json:"id"`
+		Status komariStatus `json:"status"`
+	}
+
+	decoder := json.NewDecoder(resp.Body)
+	decoder.UseNumber()
+
+	var servers []komariServer
+	if err := decoder.Decode(&servers); err != nil {
+		return nil, err
+	}
+
+	observed := make(map[string]struct{ NetIn, NetOut int64 })
+	for _, entry := range servers {
+		id := normalizeServerID(entry.ID)
+		if id == "" {
+			continue
+		}
+		observed[id] = struct{ NetIn, NetOut int64 }{
+			NetIn:  jsonNumberToInt64(entry.Status.NetInTransfer),
+			NetOut: jsonNumberToInt64(entry.Status.NetOutTransfer),
+		}
+	}
+
+	return buildPerServerResult(cfg.Servers, observed), nil
+}
+
+func normalizeServerID(id json.Number) string {
+	if v, err := id.Int64(); err == nil {
+		return strconv.FormatInt(v, 10)
+	}
+	raw := strings.TrimSpace(id.String())
+	if raw != "" && strings.ContainsAny(raw, ".eE") {
+		if f, err := id.Float64(); err == nil {
+			return strconv.FormatInt(int64(math.Round(f)), 10)
+		}
+	}
+	return raw
+}
+
+func buildPerServerResult(servers []storage.ProbeServer, observed map[string]struct{ NetIn, NetOut int64 }) []ServerTraffic {
+	var result []ServerTraffic
+	for _, srv := range servers {
+		id := strings.TrimSpace(srv.ServerID)
+		if id == "" {
+			continue
+		}
+		entry, ok := observed[id]
+		if !ok {
+			continue
+		}
+
+		var used int64
+		switch strings.ToLower(strings.TrimSpace(srv.TrafficMethod)) {
+		case storage.TrafficMethodUp:
+			used = entry.NetOut
+		case storage.TrafficMethodDown:
+			used = entry.NetIn
+		default:
+			used = entry.NetIn + entry.NetOut
+		}
+		if used < 0 {
+			used = 0
+		}
+		if srv.MonthlyTrafficBytes > 0 && used > srv.MonthlyTrafficBytes {
+			used = srv.MonthlyTrafficBytes
+		}
+
+		result = append(result, ServerTraffic{
+			Name:    srv.Name,
+			LimitGB: roundUpTwoDecimals(bytesToGigabytes(srv.MonthlyTrafficBytes)),
+			UsedGB:  roundUpTwoDecimals(bytesToGigabytes(used)),
+		})
+	}
+	return result
 }

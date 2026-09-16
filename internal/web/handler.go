@@ -18,6 +18,13 @@ var embeddedFiles embed.FS
 // 无 cookie 的用户首屏据此决定初始主题(flat / pixel),避免像素↔扁平的加载闪烁。
 const themePlaceholder = "__MMW_DEFAULT_THEME__"
 
+// 面板壁纸占位符
+const (
+	panelWallpaperPlaceholder     = "__MMW_PANEL_WALLPAPER__"
+	glassTonePlaceholder          = "__MMW_GLASS_TONE__"
+	reduceTransparencyPlaceholder = "__MMW_REDUCE_TRANSPARENCY__"
+)
+
 var (
 	initOnce    sync.Once
 	staticFS    fs.FS
@@ -28,7 +35,21 @@ var (
 	themeMu      sync.RWMutex
 	servedIndex  []byte // indexBytes 替换占位符后的实际下发内容
 	currentTheme = "pixel"
+
+	// Panel appearance
+	currentWallpaperCSS string
+	currentGlassTone    string
+	currentReduce       bool
 )
+
+var validGlassTones = map[string]bool{"sea": true, "amber": true, "ice": true, "graphite": true, "custom": true}
+
+func safeGlassTone(t string) string {
+	if validGlassTones[t] {
+		return t
+	}
+	return ""
+}
 
 // SetDefaultTheme 更新首屏注入的默认主题(flat / pixel),供无 mmw-theme-style cookie 的用户决定初始主题。
 // 由 main.go 启动时按 DB 设置调用一次,并在管理员改主题时同步调用。
@@ -40,8 +61,32 @@ func SetDefaultTheme(theme string) {
 	themeMu.Lock()
 	defer themeMu.Unlock()
 	currentTheme = theme
-	servedIndex = bytes.ReplaceAll(indexBytes, []byte(themePlaceholder), []byte(theme))
-	indexMod = time.Now() // 内容变了 → 刷新 modtime,避免 If-Modified-Since 命中旧 index
+	rebuildServedIndexLocked()
+}
+
+// SetPanelAppearance 更新首屏注入的面板外观(壁纸 CSS / 玻璃色调 / 降低透明度)。
+func SetPanelAppearance(wallpaperCSS, glassTone string, reduceTransparency bool) {
+	initOnce.Do(initialize)
+	themeMu.Lock()
+	currentWallpaperCSS = wallpaperCSS
+	currentGlassTone = glassTone
+	currentReduce = reduceTransparency
+	rebuildServedIndexLocked()
+	themeMu.Unlock()
+}
+
+// rebuildServedIndexLocked 必须在持有 themeMu 写锁时调用。
+func rebuildServedIndexLocked() {
+	s := bytes.ReplaceAll(indexBytes, []byte(themePlaceholder), []byte(currentTheme))
+	s = bytes.ReplaceAll(s, []byte(panelWallpaperPlaceholder), []byte(currentWallpaperCSS))
+	s = bytes.ReplaceAll(s, []byte(glassTonePlaceholder), []byte(safeGlassTone(currentGlassTone)))
+	rt := "false"
+	if currentReduce {
+		rt = "true"
+	}
+	s = bytes.ReplaceAll(s, []byte(reduceTransparencyPlaceholder), []byte(rt))
+	servedIndex = s
+	indexMod = time.Now()
 }
 
 func initialize() {
@@ -58,7 +103,9 @@ func initialize() {
 		panic(err)
 	}
 	// 默认先按 pixel 替换占位符;main.go 启动后会用 DB 里的值再 SetDefaultTheme 一次。
-	servedIndex = bytes.ReplaceAll(indexBytes, []byte(themePlaceholder), []byte(currentTheme))
+	themeMu.Lock()
+	rebuildServedIndexLocked()
+	themeMu.Unlock()
 
 	if info, err := fs.Stat(sub, "index.html"); err == nil {
 		indexMod = info.ModTime()

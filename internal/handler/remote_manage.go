@@ -1859,14 +1859,14 @@ func (h *RemoteManageHandler) resolveInboundCert(ctx context.Context, serverID i
 		return nil, fmt.Errorf("证书功能未初始化")
 	}
 	cert, err := h.repo.GetCertificate(ctx, certID)
-	if err != nil || cert == nil {
+	if err != nil {
 		return nil, fmt.Errorf("所选证书不存在(id=%d)", certID)
 	}
 	server, err := h.repo.GetRemoteServer(ctx, serverID)
 	if err != nil {
 		return nil, err
 	}
-	certPath, keyPath, derr := h.certHandler.DeployCertToServerSync(ctx, server, cert)
+	certPath, keyPath, derr := h.certHandler.DeployCertToServerSync(ctx, server, &cert)
 	if derr != nil {
 		return nil, fmt.Errorf("下发证书到服务器失败: %v", derr)
 	}

@@ -10,7 +10,7 @@ type subscribeFilesListHandler struct {
 	repo *storage.TrafficRepository
 }
 
-// 返回一个用于列出订阅文件的处理程序（对于所有经过身份验证的用户）。
+// NewSubscribeFilesListHandler returns a handler for listing subscribe files (for all authenticated users).
 func NewSubscribeFilesListHandler(repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
 		panic("subscribe files list handler requires repository")
@@ -33,7 +33,20 @@ func (h *subscribeFilesListHandler) ServeHTTP(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	result := convertSubscribeFiles(files)
+	// Convert to DTO format
+	result := make([]subscribeFileDTO, 0, len(files))
+	for _, file := range files {
+		result = append(result, subscribeFileDTO{
+			ID:          file.ID,
+			Name:        file.Name,
+			Description: file.Description,
+			Type:        file.Type,
+			Filename:    file.Filename,
+			ExpireAt:    file.ExpireAt,
+			CreatedAt:   file.CreatedAt,
+			UpdatedAt:   file.UpdatedAt,
+		})
+	}
 
 	respondJSON(w, http.StatusOK, map[string]any{
 		"files": result,

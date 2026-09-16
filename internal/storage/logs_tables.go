@@ -210,6 +210,69 @@ func scanIPBans(rows interface {
 	return out, rows.Err()
 }
 
+// OperationLog 是一条管理员操作审计日志。
+type OperationLog struct {
+	ID     int64     `json:"id"`
+	At     time.Time `json:"at"`
+	Actor  string    `json:"actor"`
+	Method string    `json:"method"`
+	Path   string    `json:"path"`
+	Status int       `json:"status"`
+	IP     string    `json:"ip"`
+}
+
+func (r *TrafficRepository) migrateOperationLogsTable() error {
+	const schema = `
+CREATE TABLE IF NOT EXISTS operation_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    actor TEXT NOT NULL DEFAULT '',
+    method TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    status INTEGER NOT NULL DEFAULT 0,
+    ip TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_op_logs_at ON operation_logs(at DESC);
+`
+	if _, err := r.db.Exec(schema); err != nil {
+		return fmt.Errorf("migrate operation_logs: %w", err)
+	}
+	return nil
+}
+
+func (r *TrafficRepository) InsertOperationLog(ctx context.Context, log OperationLog) error {
+	_, err := r.db.ExecContext(ctx, `INSERT INTO operation_logs (at, actor, method, path, status, ip) VALUES (?, ?, ?, ?, ?, ?)`, time.Now(), log.Actor, log.Method, log.Path, log.Status, log.IP)
+	return err
+}
+
+func (r *TrafficRepository) ListOperationLogs(ctx context.Context, limit, offset int) ([]OperationLog, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT id, at, actor, method, path, status, ip FROM operation_logs ORDER BY at DESC, id DESC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var logs []OperationLog
+	for rows.Next() {
+		var log OperationLog
+		if err := rows.Scan(&log.ID, &log.At, &log.Actor, &log.Method, &log.Path, &log.Status, &log.IP); err != nil {
+			return nil, err
+		}
+		logs = append(logs, log)
+	}
+	return logs, rows.Err()
+}
+
+func (r *TrafficRepository) DeleteOldOperationLogs(ctx context.Context, cutoff time.Time) (int64, error) {
+	result, err := r.db.ExecContext(ctx, `DELETE FROM operation_logs WHERE at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 // ---- task_runs（P3 用，方法一并放这里） ----
 
 // InsertTaskRun 记一次任务运行。

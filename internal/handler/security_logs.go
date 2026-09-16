@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,10 +14,11 @@ import (
 // SecurityLogHandler 提供安全日志（探测/封禁事件流 + 当前封禁列表）查询与封禁管理，admin 专用。
 //
 // 路由（在 main.go 注册，全部 RequireAdmin 包裹）：
-//   GET    /api/admin/security/events?kind=&ip=&limit=&offset=  事件流（后端分页）
-//   GET    /api/admin/security/bans                             当前生效封禁列表
-//   POST   /api/admin/security/bans   {ip, permanent}           手动封禁 / 提升为永久
-//   DELETE /api/admin/security/bans/{ip}                        解封
+//
+//	GET    /api/admin/security/events?kind=&ip=&limit=&offset=  事件流（后端分页）
+//	GET    /api/admin/security/bans                             当前生效封禁列表
+//	POST   /api/admin/security/bans   {ip, permanent}           手动封禁 / 提升为永久
+//	DELETE /api/admin/security/bans/{ip}                        解封
 type SecurityLogHandler struct {
 	repo *storage.TrafficRepository
 }
@@ -81,8 +83,8 @@ func (h *SecurityLogHandler) handleCreateBan(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	ip := strings.TrimSpace(body.IP)
-	if ip == "" {
-		writeBadRequest(w, "ip is required")
+	if net.ParseIP(ip) == nil {
+		writeBadRequest(w, "invalid ip address")
 		return
 	}
 	p := GetBruteForceProtector()
@@ -96,8 +98,8 @@ func (h *SecurityLogHandler) handleCreateBan(w http.ResponseWriter, r *http.Requ
 
 func (h *SecurityLogHandler) handleUnban(w http.ResponseWriter, r *http.Request, ip string) {
 	ip = strings.TrimSpace(ip)
-	if ip == "" {
-		writeBadRequest(w, "ip is required")
+	if net.ParseIP(ip) == nil {
+		writeBadRequest(w, "invalid ip address")
 		return
 	}
 	p := GetBruteForceProtector()

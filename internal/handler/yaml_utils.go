@@ -9,9 +9,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// 用 2 个空格缩进编组 YAML 节点
+// MarshalYAMLWithIndent marshals a YAML node with 2-space indentation
 func MarshalYAMLWithIndent(node *yaml.Node) ([]byte, error) {
-	// 在编码之前清理显式字符串标签以防止 !!str 出现在输出中
+	// Sanitize explicit string tags before encoding to prevent !!str from appearing in output
 	sanitizeExplicitStringTags(node)
 
 	var buf bytes.Buffer
@@ -26,7 +26,7 @@ func MarshalYAMLWithIndent(node *yaml.Node) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// 使用 2 个空格缩进将任何值编组到 YAML
+// MarshalWithIndent marshals any value to YAML with 2-space indentation
 func MarshalWithIndent(v interface{}) ([]byte, error) {
 	var buf bytes.Buffer
 	encoder := yaml.NewEncoder(&buf)
@@ -40,10 +40,12 @@ func MarshalWithIndent(v interface{}) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// RemoveUnicodeEscapeQuotes 从包含 Unicode 转义序列的字符串中删除引号
-// 并将转义序列转换回实际的 Unicode 字符（如表情符号）。
-// 对于已知的数字字段（端口、间隔等），删除引号以确保正确的数字类型。
+// RemoveUnicodeEscapeQuotes removes quotes from strings that contain Unicode escape sequences
+// and converts the escape sequences back to actual Unicode characters (like emoji).
+// For known numeric fields (port, interval, etc.), removes quotes to ensure proper numeric type.
+// Note: nameserver-policy values are preserved with quotes to maintain DNS policy format.
 func RemoveUnicodeEscapeQuotes(yamlContent string) string {
+	// 使用占位符保留原始nameserver-policy配置
 	var nameserverPolicyBlock string
 	nameserverPolicyRe := regexp.MustCompile(`(?ms)^(nameserver-policy:\s*\n)((?:[ \t]+.+\n?)*)`)
 	yamlContent = nameserverPolicyRe.ReplaceAllStringFunc(yamlContent, func(match string) string {
@@ -51,39 +53,42 @@ func RemoveUnicodeEscapeQuotes(yamlContent string) string {
 		return "___NAMESERVER_POLICY_PLACEHOLDER___\n"
 	})
 
+	// Step 1: Remove quotes from strings that contain Unicode escape sequences
+	// Pattern: "...\U000XXXXX..." or "...\uXXXX..."
+	// But keep quotes if the unquoted string would start with YAML special characters
 	quotedUnicodeRe := regexp.MustCompile(`"([^"]*\\[Uu][0-9A-Fa-f]{4,8}[^"]*)"`)
 	result := quotedUnicodeRe.ReplaceAllStringFunc(yamlContent, func(match string) string {
-		// 获取不带引号的内容
+		// Get the content without quotes
 		content := strings.Trim(match, `"`)
 
-		// 首先将 Unicode 转义转换为实际字符以检查真正的第一个字符
+		// First convert Unicode escapes to actual characters to check the real first character
 		tempContent := convertUnicodeEscapes(content)
 
-		// 检查不带引号的字符串是否以需要引用的 YAML 特殊字符开头
-		// 这些字符在YAML中有特殊含义，需要加引号
+		// Check if the unquoted string would start with YAML special characters that need quoting
+		// These characters have special meaning in YAML and need to be quoted
 		if len(tempContent) > 0 {
 			firstChar := tempContent[0]
-			// 需要在开头引用的字符： [ ] { } * & ! | > ' " % @ ` # , ? :-
+			// Characters that need quoting at the start: [ ] { } * & ! | > ' " % @ ` # , ? : -
 			if firstChar == '[' || firstChar == ']' || firstChar == '{' || firstChar == '}' ||
 				firstChar == '*' || firstChar == '&' || firstChar == '!' || firstChar == '|' ||
 				firstChar == '>' || firstChar == '\'' || firstChar == '"' || firstChar == '%' ||
 				firstChar == '@' || firstChar == '`' || firstChar == '#' || firstChar == ',' ||
 				firstChar == '?' || firstChar == ':' || firstChar == '-' {
-				// 保留引号，但仍然在内部转换 Unicode 转义符
+				// Keep the quotes but still convert Unicode escapes inside
 				return `"` + convertUnicodeEscapes(content) + `"`
 			}
 		}
 
-		// 安全删除引号
+		// Safe to remove quotes
 		return content
 	})
 
-	// 第 2 步：将所有 Unicode 转义符转换回实际字符​​（带引号或不带引号）
+	// Step 2: Convert ALL Unicode escapes back to actual characters (quoted or not)
 	// \U0001F4B0 -> 💰, \u4E2D -> 中, \U0001F1ED\U0001F1F0 -> 🇭🇰
 	result = convertUnicodeEscapes(result)
 
-	// 步骤 3：从已知数字字段的数值中删除引号
-	// 仅取消引用预计为数字的字段，以避免更改名称/服务器等字符串类型字段。
+	// Step 3: Remove quotes from numeric values for known numeric fields
+	// Only unquote fields that are expected to be numbers to avoid changing string-typed fields like name/server.
 	numericFields := []string{
 		"port", "socks-port", "redir-port", "tproxy-port", "mixed-port", "dns-port",
 		"interval", "timeout", "geo-update-interval", "update-interval",
@@ -94,6 +99,7 @@ func RemoveUnicodeEscapeQuotes(yamlContent string) string {
 	numericQuotesRe := regexp.MustCompile(numericFieldsPattern)
 	result = numericQuotesRe.ReplaceAllString(result, `$1$2: $3`)
 
+	// 回复nameserver-policy配置
 	if nameserverPolicyBlock != "" {
 		result = strings.Replace(result, "___NAMESERVER_POLICY_PLACEHOLDER___\n", nameserverPolicyBlock, 1)
 	}
@@ -101,7 +107,7 @@ func RemoveUnicodeEscapeQuotes(yamlContent string) string {
 	return result
 }
 
-// ConvertUnicodeEscapes 将 Unicode 转义序列转换为实际字符
+// convertUnicodeEscapes converts Unicode escape sequences to actual characters
 func convertUnicodeEscapes(s string) string {
 	escapeRe := regexp.MustCompile(`\\U([0-9A-Fa-f]{8})|\\u([0-9A-Fa-f]{4})`)
 	return escapeRe.ReplaceAllStringFunc(s, func(escapeSeq string) string {
@@ -203,31 +209,31 @@ func looksLikeNumericStringWithLeadingZero(s string) bool {
 	return false
 }
 
-// sanitizeExplicitStringTags 通过清除从标量节点中删除显式 !!str 标签
-// TaggedStyle 位。这可以防止 YAML 编码器发出文字 !!str 标签
-// 输出中，这可能会导致某些 YAML 客户端出现解析错误。
+// sanitizeExplicitStringTags removes explicit !!str tags from scalar nodes by clearing
+// the TaggedStyle bit. This prevents the YAML encoder from emitting literal !!str tags
+// in the output, which can cause parsing errors in some YAML clients.
 //
-// 该函数递归地遍历整个节点树并标准化所有标量节点
-// 具有显式字符串标签（!!str 或 tag:yaml.org,2002:str）。清除后
-// TaggedStyle 位，编码器将使用隐式类型并自动添加引号
-// 需要时，保持语义正确性，同时提高兼容性。
+// The function recursively walks the entire node tree and normalizes any scalar nodes
+// that have explicit string tags (!!str or tag:yaml.org,2002:str). After clearing the
+// TaggedStyle bit, the encoder will use implicit typing and add quotes automatically
+// when needed, maintaining semantic correctness while improving compatibility.
 func sanitizeExplicitStringTags(node *yaml.Node) {
 	if node == nil {
 		return
 	}
 
-	// 清除具有显式字符串标签的标量节点的 TaggedStyle
+	// Clear TaggedStyle for scalar nodes with explicit string tags
 	if node.Kind == yaml.ScalarNode && isExplicitStringTag(node.Tag) {
 		node.Style &^= yaml.TaggedStyle
 	}
 
-	// 递归处理所有子节点
+	// Recursively process all child nodes
 	for _, child := range node.Content {
 		sanitizeExplicitStringTags(child)
 	}
 }
 
-// 检查给定的 YAML 标记是否表示显式字符串类型
+// isExplicitStringTag checks if the given YAML tag represents an explicit string type
 func isExplicitStringTag(tag string) bool {
 	return tag == "!!str" || tag == "tag:yaml.org,2002:str"
 }

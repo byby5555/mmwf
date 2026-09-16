@@ -13,22 +13,11 @@ import (
 
 // InviteCode 邀请码记录。kind='new' 时 PackageID 可选(创建账号时自动绑该套餐);
 // kind='bind' 时 BindUsername 必填(锁定到指定 username)。
-type InviteCode struct {
-	Code         string
-	Kind         string // "new" | "bind"
-	BindUsername string
-	CreatedBy    string
-	PackageID    *int64
-	MaxUses      int
-	UsedCount    int
-	ExpiresAt    *time.Time
-	Revoked      bool
-	Remark       string
-	CreatedAt    time.Time
-	// DurationMonths 仅 kind=new 有用:注册时账号有效期 = now + N 个月。
-	// 0 = 沿用套餐自身周期(cycle_days)的旧行为。>1 时 bind 自动开 is_reset(按月重置/续期)。
-	DurationMonths int
-}
+
+// "new" | "bind"
+
+// DurationMonths 仅 kind=new 有用:注册时账号有效期 = now + N 个月。
+// 0 = 沿用套餐自身周期(cycle_days)的旧行为。>1 时 bind 自动开 is_reset(按月重置/续期)。
 
 // IsUsable 邀请码是否当前可消耗(未撤销 + 未达使用上限 + 未过期)。
 func (ic InviteCode) IsUsable() bool {
@@ -45,14 +34,11 @@ func (ic InviteCode) IsUsable() bool {
 }
 
 // TGAudit 操作审计行。
-type TGAudit struct {
-	ID       int64
-	TGID     int64 // 0 表示无 tg_id(如系统操作)
-	Username string
-	Action   string // 'register' | 'bind' | 'unbind' | 'admin_invite_create' | ...
-	Detail   string // JSON 或纯文本
-	At       time.Time
-}
+
+// 0 表示无 tg_id(如系统操作)
+
+// 'register' | 'bind' | 'unbind' | 'admin_invite_create' | ...
+// JSON 或纯文本
 
 // ============ 用户 TG 字段读写 ============
 
@@ -119,10 +105,10 @@ func (r *TrafficRepository) UnbindTelegram(ctx context.Context, username string)
 
 // NotifyTarget 每日推送名单的一行(轻量,流量/套餐细节由 handler 现取)。
 type NotifyTarget struct {
-	Username       string
-	TelegramID     int64
-	PackageID      int64
-	PackageEndDate *time.Time
+	Username	string
+	TelegramID	int64
+	PackageID	int64
+	PackageEndDate	*time.Time
 }
 
 // SetTGNotify 按 tg_id 开关用户通知。未绑(影响 0 行)返回错误。
@@ -189,9 +175,9 @@ func (r *TrafficRepository) ListNotifyUsers(ctx context.Context) ([]NotifyTarget
 
 // TGPackageUser 绑定了 TG 且当前有生效套餐的用户(供公告定向广播)。
 type TGPackageUser struct {
-	Username   string
-	TelegramID int64
-	PackageID  int64
+	Username	string
+	TelegramID	int64
+	PackageID	int64
 }
 
 // ListActivePackageTGUsers 列出「绑定 TG + 有生效套餐(未过期)」的用户。公告只发给有套餐的用户,
@@ -221,7 +207,7 @@ func (r *TrafficRepository) ListActivePackageTGUsers(ctx context.Context) ([]TGP
 
 // GenerateInviteCode 生成 12 位大小写字母数字串(密码学随机)。
 func GenerateInviteCode() (string, error) {
-	buf := make([]byte, 9) // 9 bytes hex → 18 chars,截到 12 位够熵且短
+	buf := make([]byte, 9)	// 9 bytes hex → 18 chars,截到 12 位够熵且短
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
@@ -439,8 +425,8 @@ func (r *TrafficRepository) ListInviteCodes(ctx context.Context, createdBy strin
 // WriteTGAudit 写一条审计。失败时打 log 即可,不影响主流程(由调用方决定)。
 func (r *TrafficRepository) WriteTGAudit(ctx context.Context, a TGAudit) error {
 	var tgArg any
-	if a.TGID != 0 {
-		tgArg = a.TGID
+	if a.TGID != nil && *a.TGID != 0 {
+		tgArg = *a.TGID
 	}
 	_, err := r.db.ExecContext(ctx,
 		`INSERT INTO tg_audit (tg_id, username, action, detail) VALUES (?, ?, ?, ?)`,

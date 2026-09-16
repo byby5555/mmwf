@@ -112,7 +112,7 @@ func (m *Manager) doSync(ctx context.Context, server *storage.RemoteServer) erro
 			wrote = true
 		}
 	}
-	if v6 := strings.TrimSpace(server.IPAddressV6); server.IPv6Enabled && v6 != "" {
+	if v6 := strings.TrimSpace(server.IPAddressV6); server.Ipv6Enabled && v6 != "" {
 		if p := net.ParseIP(v6); p != nil && p.To4() == nil {
 			if e := provider.UpsertRecord(ctx, fqdnV6, "AAAA", v6, 0); e != nil {
 				syncErrs = append(syncErrs, fmt.Sprintf("AAAA: %v", e))
@@ -136,8 +136,8 @@ func (m *Manager) doSync(ctx context.Context, server *storage.RemoteServer) erro
 //   - == 0(自动)→ 先按证书(匹配域名且证书绑了 DNS 服务商);
 //     没证书 / 证书没绑服务商 → 遍历所有 dns_providers,用「能管辖该域名(CanManage 只读探测)」的第一个。
 func (m *Manager) resolveProviderID(ctx context.Context, server *storage.RemoteServer, fqdn string) (int64, error) {
-	if server.DDNSProviderID > 0 {
-		return server.DDNSProviderID, nil
+	if int64(server.DDNSProviderID) > 0 {
+		return int64(server.DDNSProviderID), nil
 	}
 	// 自动第一步:按证书
 	if cert, err := m.repo.FindCertificateForDomain(ctx, fqdn); err == nil && cert != nil && cert.DNSProviderID > 0 {
