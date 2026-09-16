@@ -143,6 +143,15 @@ func (w *replayWindow) Check(seq uint64) bool {
 	return true
 }
 
+// DeriveSessionV2 derives session keys using v2 protocol:
+// HKDF info = "securechan-v2\n" + sessionID, no salt.
+// Used by the new frontend (mmwx-pro) secure channel.
+func DeriveSessionV2(sharedSecret []byte, sessionID string, isMaster bool) (*Session, error) {
+	info := []byte("securechan-v2\n" + sessionID)
+	hk := hkdf.New(sha256.New, sharedSecret, nil, info)
+	return deriveFromHKDF(hk, isMaster)
+}
+
 // DeriveSession derives directional AES-256-GCM session keys from a shared secret.
 // isMaster determines which direction gets which key.
 func DeriveSession(sharedSecret, agentEphPub, masterEphPub []byte, isMaster bool) (*Session, error) {
@@ -151,7 +160,11 @@ func DeriveSession(sharedSecret, agentEphPub, masterEphPub []byte, isMaster bool
 	salt = append(salt, masterEphPub...)
 
 	hk := hkdf.New(sha256.New, sharedSecret, salt, []byte("securechan-v1"))
+	return deriveFromHKDF(hk, isMaster)
+}
 
+// deriveFromHKDF extracts directional keys from an HKDF reader and builds a Session.
+func deriveFromHKDF(hk io.Reader, isMaster bool) (*Session, error) {
 	var keys [4][]byte // sendKey, recvKey, sendNonce, recvNonce
 	for i := range keys {
 		keys[i] = make([]byte, 32)
