@@ -1,18 +1,19 @@
 #!/bin/bash
 
-# 妙妙屋X - Xray 服务器管理与订阅拼车系统 安装脚本
+# mmwX Pro - sing-box 订阅管理系统 安装脚本
 # 适用于 Debian/Ubuntu Linux 系统
 
 set -e
 
 # 配置
-GITHUB_REPO="iluobei/miaomiaowuX"
+GITHUB_REPO="byby5555/mmwx-pro"
 VERSION=""  # 将自动获取最新版本
 BINARY_NAME=""  # 将根据架构自动设置
 INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="mmwx"
 DATA_DIR="/etc/mmwx"
 CONFIG_DIR="/etc/mmwx"
+DEFAULT_PORT=8080
 
 # 颜色输出
 RED='\033[0;31m'
@@ -85,7 +86,7 @@ get_latest_version() {
 
 # 下载二进制文件
 download_binary() {
-    echo_info "下载 $SERVICE_NAME $VERSION..."
+    echo_info "下载 mmwX Pro $VERSION..."
     DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${BINARY_NAME}"
 
     cd /tmp
@@ -118,23 +119,21 @@ create_directories() {
 create_systemd_service() {
     echo_info "创建 systemd 服务..."
 
-    # 询问端口号（支持非交互式环境）
+    # 端口号（支持非交互式环境）
     echo ""
     if [ -t 0 ]; then
-        # 交互式环境，可以读取用户输入
-        read -p "请输入端口号（默认 12889，直接回车使用默认值）: " PORT_INPUT
+        read -p "请输入端口号（默认 $DEFAULT_PORT，直接回车使用默认值）: " PORT_INPUT
         if [ -z "$PORT_INPUT" ]; then
-            PORT_INPUT=12889
+            PORT_INPUT=$DEFAULT_PORT
         fi
     else
-        # 非交互式环境（如管道），使用默认值
-        PORT_INPUT=${PORT:-12889}
+        PORT_INPUT=${PORT:-$DEFAULT_PORT}
         echo_info "使用端口: $PORT_INPUT"
     fi
 
     cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
-Description=妙妙屋X - Xray 服务器管理与订阅拼车系统
+Description=mmwX Pro - sing-box 订阅管理系统
 After=network.target
 Wants=network-online.target
 
@@ -184,13 +183,12 @@ start_service() {
 
 # 显示状态
 show_status() {
-    # 从 systemd 服务文件中读取端口号
     CONFIGURED_PORT=$(grep "Environment=\"PORT=" /etc/systemd/system/${SERVICE_NAME}.service | sed 's/.*PORT=\([0-9]*\).*/\1/')
-    CONFIGURED_PORT=${CONFIGURED_PORT:-12889}
+    CONFIGURED_PORT=${CONFIGURED_PORT:-$DEFAULT_PORT}
 
     echo ""
     echo "======================================"
-    echo_info "妙妙屋X 安装完成！"
+    echo_info "mmwX Pro 安装完成！"
     echo "======================================"
     echo ""
     echo "📦 安装位置: $INSTALL_DIR/$SERVICE_NAME"
@@ -213,16 +211,14 @@ show_status() {
 
 # 更新服务
 update_service() {
-    echo_info "开始更新妙妙屋X..."
+    echo_info "开始更新 mmwX Pro..."
     echo ""
 
-    # 检查服务是否已安装
     if [ ! -f "$INSTALL_DIR/$SERVICE_NAME" ]; then
         echo_error "未检测到已安装的服务，请先使用安装模式"
         exit 1
     fi
 
-    # 显示当前版本
     if [ -f "$DATA_DIR/.version" ]; then
         CURRENT_VERSION=$(cat "$DATA_DIR/.version")
         echo_info "当前版本: $CURRENT_VERSION"
@@ -230,46 +226,35 @@ update_service() {
     echo_info "目标版本: $VERSION"
     echo ""
 
-    # 停止服务
     echo_info "停止服务..."
     systemctl stop ${SERVICE_NAME}.service || true
 
-    # 备份当前二进制文件
     if [ -f "$INSTALL_DIR/$SERVICE_NAME" ]; then
         echo_info "备份当前版本..."
         cp "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak"
     fi
 
-    # 下载并安装新版本
     download_binary
     install_binary
 
-    # 保存版本信息
     echo "$VERSION" > "$DATA_DIR/.version"
 
-    # 询问是否修改端口（支持非交互式环境）
     CURRENT_PORT=$(grep "Environment=\"PORT=" /etc/systemd/system/${SERVICE_NAME}.service 2>/dev/null | sed 's/.*PORT=\([0-9]*\).*/\1/')
-    CURRENT_PORT=${CURRENT_PORT:-12889}
+    CURRENT_PORT=${CURRENT_PORT:-$DEFAULT_PORT}
     echo ""
     if [ -t 0 ]; then
-        # 交互式环境
         read -p "请输入端口号（默认 $CURRENT_PORT，直接回车使用默认值）: " PORT_INPUT
         if [ -z "$PORT_INPUT" ]; then
             PORT_INPUT=$CURRENT_PORT
         fi
     else
-        # 非交互式环境，保持当前端口或使用环境变量
         PORT_INPUT=${PORT:-$CURRENT_PORT}
         echo_info "使用端口: $PORT_INPUT"
     fi
 
-    # 更新 systemd 服务文件中的端口
     sed -i "s/Environment=\"PORT=[0-9]*\"/Environment=\"PORT=$PORT_INPUT\"/" /etc/systemd/system/${SERVICE_NAME}.service
-
-    # 重新加载 systemd 配置
     systemctl daemon-reload
 
-    # 启动服务
     if start_service; then
         echo ""
         echo "======================================"
@@ -295,23 +280,20 @@ update_service() {
 
 # 卸载服务
 uninstall_service() {
-    echo_info "开始卸载妙妙屋X..."
+    echo_info "开始卸载 mmwX Pro..."
     echo ""
 
-    # 检查服务是否已安装
     if [ ! -f "$INSTALL_DIR/$SERVICE_NAME" ]; then
         echo_error "未检测到已安装的服务"
         exit 1
     fi
 
-    # 显示当前版本
     if [ -f "$DATA_DIR/.version" ]; then
         CURRENT_VERSION=$(cat "$DATA_DIR/.version")
         echo_info "当前版本: $CURRENT_VERSION"
         echo ""
     fi
 
-    # 停止并禁用服务
     echo_info "停止并禁用服务..."
     systemctl stop ${SERVICE_NAME}.service || true
     systemctl disable ${SERVICE_NAME}.service || true
@@ -321,7 +303,6 @@ uninstall_service() {
     # 询问是否保留配置和数据
     KEEP_DATA=false
     if [ -t 0 ]; then
-        # 交互式环境
         echo "是否保留配置和数据？"
         echo "  1) 完全删除（删除所有文件和数据）"
         echo "  2) 保留数据（保留 $DATA_DIR 和 $CONFIG_DIR 目录）"
@@ -333,7 +314,6 @@ uninstall_service() {
             KEEP_DATA=true
         fi
     else
-        # 非交互式环境，检查环境变量
         if [ "$KEEP_DATA" != "false" ]; then
             KEEP_DATA=true
         fi
@@ -345,20 +325,17 @@ uninstall_service() {
     fi
     echo ""
 
-    # 删除 systemd 服务文件
     echo_info "删除 systemd 服务..."
     rm -f /etc/systemd/system/${SERVICE_NAME}.service
     systemctl daemon-reload
     echo_info "✓ systemd 服务已删除"
     echo ""
 
-    # 删除二进制文件
     echo_info "删除程序文件..."
     rm -f "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak"
     echo_info "✓ 程序文件已删除"
     echo ""
 
-    # 根据选择删除或保留数据
     if [ "$KEEP_DATA" = "false" ]; then
         echo_info "删除数据和配置..."
         rm -rf "$DATA_DIR" "$CONFIG_DIR"
@@ -383,28 +360,24 @@ uninstall_service() {
 
 # 覆盖安装（全量重装，保留数据）
 reinstall_service() {
-    echo_info "开始覆盖安装妙妙屋X..."
+    echo_info "开始覆盖安装 mmwX Pro..."
     echo ""
 
-    # 停止已有服务
     if systemctl is-active --quiet ${SERVICE_NAME}.service 2>/dev/null; then
         echo_info "停止现有服务..."
         systemctl stop ${SERVICE_NAME}.service || true
     fi
 
-    # 备份当前二进制文件
     if [ -f "$INSTALL_DIR/$SERVICE_NAME" ]; then
         echo_info "备份当前版本..."
         cp "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak"
     fi
 
-    # 全量覆盖：下载、安装、重建目录和服务
     download_binary
     install_binary
     create_directories
     create_systemd_service
 
-    # 保存版本信息
     echo "$VERSION" > "$DATA_DIR/.version"
 
     if start_service; then
@@ -430,7 +403,6 @@ reinstall_service() {
 
 # 主函数
 main() {
-    # 检查命令行参数
     if [ "$1" = "update" ]; then
         echo_info "进入更新模式..."
         check_root
@@ -450,7 +422,7 @@ main() {
         check_root
         uninstall_service
     else
-        echo_info "开始安装妙妙屋X..."
+        echo_info "开始安装 mmwX Pro..."
         echo ""
 
         check_root
@@ -462,7 +434,6 @@ main() {
         create_directories
         create_systemd_service
 
-        # 保存版本信息
         echo "$VERSION" > "$DATA_DIR/.version"
 
         if start_service; then
